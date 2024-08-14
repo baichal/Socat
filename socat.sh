@@ -5,8 +5,7 @@ export PATH
 # ====================================================
 #    系统要求: CentOS 6+、Debian 7+、Ubuntu 14+
 #    描述: Socat 一键安装管理脚本
-#    版本: 2.8
-#    作者：白茶
+#    版本: 3.0
 # ====================================================
 
 Green="\033[32m"
@@ -14,6 +13,9 @@ Font="\033[0m"
 Blue="\033[34m"
 Red="\033[31m"
 Yellow="\033[33m"
+
+# 配置文件路径
+CONFIG_FILE="./socat_forwards.conf"
 
 # 清屏函数
 clear_screen() {
@@ -51,22 +53,10 @@ check_sys(){
     fi
 }
 
-# 获取本机IP（使用多个备选服务）
+# 获取本机IP（优化版本）
 get_ip(){
-    local ip_services=("http://ipv4.icanhazip.com" "http://api.ipify.org" "http://ifconfig.me")
-    for service in "${ip_services[@]}"; do
-        ip=$(curl -s -m 10 "$service")
-        if [[ -n "$ip" ]]; then
-            break
-        fi
-    done
-
+    ip=$(ip addr | grep 'inet ' | grep -v 127.0.0.1 | head -n1 | awk '{print $2}' | cut -d'/' -f1)
     if [[ -z "$ip" ]]; then
-        ip=$(ip addr | grep 'inet ' | grep -v 127.0.0.1 | head -n1 | awk '{print $2}' | cut -d'/' -f1)
-    fi
-
-    if [[ -z "$ip" ]]; then
-        echo -e "${Red}无法获取服务器IP地址${Font}"
         ip="未知"
     fi
 }
@@ -90,6 +80,24 @@ install_socat(){
     fi
 }
 
+# 初始化配置文件
+init_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        touch "$CONFIG_FILE"
+    fi
+}
+
+# 添加转发到配置文件
+add_to_config() {
+    echo "$port1 $socatip $port2" >> "$CONFIG_FILE"
+}
+
+# 从配置文件中移除转发
+remove_from_config() {
+    local listen_port=$1
+    sed -i "/^$listen_port /d" "$CONFIG_FILE"
+}
+
 # 配置Socat
 config_socat(){
     echo -e "${Green}请输入Socat配置信息！${Font}"
@@ -101,7 +109,7 @@ config_socat(){
 # 启动Socat
 start_socat(){
     echo -e "${Green}正在配置Socat...${Font}"
-    nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> /root/socat.log 2>&1 &
+    nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> ./socat.log 2>&1 &
 
     # 检查是否成功启动
     sleep 2
@@ -110,10 +118,10 @@ start_socat(){
         echo -e "${Blue}本地端口: ${port1}${Font}"
         echo -e "${Blue}远程端口: ${port2}${Font}"
         echo -e "${Blue}远程IP: ${socatip}${Font}"
-        get_ip
         echo -e "${Blue}本地服务器IP: ${ip}${Font}"
 
-        # 添加到开机自启
+        # 添加到配置文件和开机自启
+        add_to_config
         add_to_startup
     else
         echo -e "${Red}Socat启动失败，请检查配置和系统设置。${Font}"
@@ -127,7 +135,7 @@ add_to_startup() {
         echo '#!/bin/bash' > "$rc_local"
     fi
 
-    startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> /root/socat.log 2>&1 &"
+    startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> $(pwd)/socat.log 2>&1 &"
     if ! grep -q "$startup_cmd" "$rc_local"; then
         echo "$startup_cmd" >> "$rc_local"
         chmod +x "$rc_local"
@@ -139,54 +147,33 @@ add_to_startup() {
 
 # 显示和删除转发
 view_delete_forward() {
-    local forwards=$(ps aux | grep socat | grep -v grep | grep -v "socat.sh")
-    if [ -z "$forwards" ]; then
+    if [ ! -s "$CONFIG_FILE" ]; then
         echo -e "${Red}当前没有活动的转发。${Font}"
         return
     fi
 
     echo -e "${Green}当前转发列表:${Font}"
     local i=1
-    declare -A unique_forwards
-
     while read -r line; do
-        local pid=$(echo $line | awk '{print $2}')
-        local config=$(echo $line | awk -F'socat ' '{print $2}')
-        local listen_port=$(echo $config | awk -F'LISTEN:' '{print $2}' | cut -d',' -f1)
-        local remote_info=$(echo $config | awk -F'TCP4:' '{print $2}')
-        local remote_ip=$(echo $remote_info | cut -d: -f1)
-        local remote_port=$(echo $remote_info | cut -d: -f2)
-
-        local key="${listen_port}:${remote_ip}:${remote_port}"
-        if [[ -z ${unique_forwards[$key]} ]]; then
-            unique_forwards[$key]="$i. $ip:$listen_port --> $remote_ip:$remote_port (PID: $pid)"
-            ((i++))
-        fi
-    done <<< "$forwards"
-
-    for forward in "${unique_forwards[@]}"; do
-        echo "$forward"
-    done
+        local listen_port=$(echo $line | awk '{print $1}')
+        local remote_ip=$(echo $line | awk '{print $2}')
+        local remote_port=$(echo $line | awk '{print $3}')
+        echo "$i. $ip:$listen_port --> $remote_ip:$remote_port"
+        ((i++))
+    done < "$CONFIG_FILE"
 
     read -p "请输入要删除的转发编号（多个编号用空格分隔，直接回车取消）: " numbers
     if [ -n "$numbers" ]; then
         for num in $numbers; do
-            local selected_forward=""
-            for forward in "${unique_forwards[@]}"; do
-                if [[ $forward == $num.* ]]; then
-                    selected_forward=$forward
-                    break
-                fi
-            done
-
-            if [ -n "$selected_forward" ]; then
-                local listen_port=$(echo $selected_forward | awk -F':' '{print $2}' | awk '{print $1}')
-                local pids=$(pgrep -f "socat.*LISTEN:${listen_port}")
-                for pid in $pids; do
-                    kill -9 $pid
-                    echo -e "${Green}已删除转发: PID $pid${Font}"
-                done
+            if [ $num -ge 1 ] && [ $num -lt $i ]; then
+                local line=$(sed -n "${num}p" "$CONFIG_FILE")
+                local listen_port=$(echo $line | awk '{print $1}')
+                pkill -f "socat.*LISTEN:${listen_port}"
+                remove_from_config $listen_port
                 remove_from_startup $listen_port
+                echo -e "${Green}已删除转发: $ip:$listen_port${Font}"
+            else
+                echo -e "${Red}无效的编号: $num${Font}"
             fi
         done
     fi
@@ -212,9 +199,11 @@ kill_all_socat() {
     else
         echo -e "${Green}所有 Socat 进程已成功终止。${Font}"
     fi
+    # 清空配置文件
+    > "$CONFIG_FILE"
     # 清理开机自启动脚本
     sed -i '/socat TCP4-LISTEN/d' /etc/rc.local
-    echo -e "${Green}已从开机自启动中移除所有 Socat 转发${Font}"
+    echo -e "${Green}已从配置和开机自启动中移除所有 Socat 转发${Font}"
 }
 
 # 显示菜单
@@ -232,6 +221,8 @@ main() {
     check_root
     check_sys
     install_socat
+    get_ip
+    init_config
     clear_screen
 
     while true; do
