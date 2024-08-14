@@ -1,4 +1,4 @@
-#Socat一键安装脚本
+# Socat一键安装脚本
 系统要求：支持CentOS 6+ 、Debian 7+、Ubuntu 14+
 
 脚本说明：脚本默认开启UDP、TCP转发，带开机自启功能。
