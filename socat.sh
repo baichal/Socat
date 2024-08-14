@@ -5,7 +5,7 @@ export PATH
 # ====================================================
 #    系统要求: CentOS 6+、Debian 7+、Ubuntu 14+
 #    描述: Socat 一键安装管理脚本
-#    版本: 3.0
+#    版本: 3.1
 # ====================================================
 
 Green="\033[32m"
@@ -109,7 +109,7 @@ config_socat(){
 # 启动Socat
 start_socat(){
     echo -e "${Green}正在配置Socat...${Font}"
-    nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> ./socat.log 2>&1 &
+    nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> ./socat.log 2>&1 &
 
     # 检查是否成功启动
     sleep 2
@@ -135,7 +135,7 @@ add_to_startup() {
         echo '#!/bin/bash' > "$rc_local"
     fi
 
-    startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2} >> $(pwd)/socat.log 2>&1 &"
+    startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> $(pwd)/socat.log 2>&1 &"
     if ! grep -q "$startup_cmd" "$rc_local"; then
         echo "$startup_cmd" >> "$rc_local"
         chmod +x "$rc_local"
@@ -206,13 +206,152 @@ kill_all_socat() {
     echo -e "${Green}已从配置和开机自启动中移除所有 Socat 转发${Font}"
 }
 
+# 开启端口转发加速
+enable_acceleration() {
+    echo -e "${Green}正在开启端口转发加速...${Font}"
+    
+    # 启用 TCP Fast Open
+    echo 3 > /proc/sys/net/ipv4/tcp_fastopen
+    
+    # 优化内核参数
+    sysctl -w net.ipv4.tcp_congestion_control=bbr
+    sysctl -w net.core.default_qdisc=fq
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=0
+    sysctl -w net.ipv4.tcp_mtu_probing=1
+    
+    # 新增优化参数
+    sysctl -w net.core.rmem_max=26214400
+    sysctl -w net.core.wmem_max=26214400
+    sysctl -w net.ipv4.tcp_rmem='4096 87380 26214400'
+    sysctl -w net.ipv4.tcp_wmem='4096 16384 26214400'
+    sysctl -w net.ipv4.tcp_mem='26214400 26214400 26214400'
+    sysctl -w net.core.netdev_max_backlog=2048
+    sysctl -w net.ipv4.tcp_max_syn_backlog=2048
+    sysctl -w net.ipv4.tcp_tw_reuse=1
+    sysctl -w net.ipv4.tcp_fin_timeout=15
+    sysctl -w net.ipv4.tcp_keepalive_time=1200
+    sysctl -w net.ipv4.tcp_max_tw_buckets=2000000
+    sysctl -w net.ipv4.tcp_fastopen=3
+    sysctl -w net.ipv4.tcp_mtu_probing=1
+    sysctl -w net.ipv4.tcp_syncookies=1
+    sysctl -w net.ipv4.tcp_rfc1337=1
+    sysctl -w net.ipv4.tcp_sack=1
+    sysctl -w net.ipv4.tcp_fack=1
+    sysctl -w net.ipv4.tcp_window_scaling=1
+    sysctl -w net.ipv4.tcp_adv_win_scale=2
+    sysctl -w net.ipv4.tcp_moderate_rcvbuf=1
+    sysctl -w net.core.optmem_max=65535
+    sysctl -w net.ipv4.tcp_notsent_lowat=16384
+    
+    # 持久化设置
+    echo "net.ipv4.tcp_fastopen = 3" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_slow_start_after_idle = 0" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.conf
+    # 添加新增的优化参数到sysctl.conf
+    echo "net.core.rmem_max = 26214400" >> /etc/sysctl.conf
+    echo "net.core.wmem_max = 26214400" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_rmem = 4096 87380 26214400" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_wmem = 4096 16384 26214400" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_mem = 26214400 26214400 26214400" >> /etc/sysctl.conf
+    echo "net.core.netdev_max_backlog = 2048" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_max_syn_backlog = 2048" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_tw_reuse = 1" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_fin_timeout = 15" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_keepalive_time = 1200" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_max_tw_buckets = 2000000" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_fastopen = 3" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_syncookies = 1" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_rfc1337 = 1" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_sack = 1" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_fack = 1" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_window_scaling = 1" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_adv_win_scale = 2" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_moderate_rcvbuf = 1" >> /etc/sysctl.conf
+    echo "net.core.optmem_max = 65535" >> /etc/sysctl.conf
+    echo "net.ipv4.tcp_notsent_lowat = 16384" >> /etc/sysctl.conf
+    
+    sysctl -p
+    
+    echo -e "${Green}端口转发加速已开启${Font}"
+}
+
+# 关闭端口转发加速
+disable_acceleration() {
+    echo -e "${Yellow}正在关闭端口转发加速...${Font}"
+    
+    # 恢复默认内核参数
+    sysctl -w net.ipv4.tcp_fastopen=0
+    sysctl -w net.ipv4.tcp_congestion_control=cubic
+    sysctl -w net.core.default_qdisc=pfifo_fast
+    sysctl -w net.ipv4.tcp_slow_start_after_idle=1
+    sysctl -w net.ipv4.tcp_mtu_probing=0
+    
+    # 恢复其他参数到默认值
+    sysctl -w net.core.wmem_max=212992
+    sysctl -w net.ipv4.tcp_rmem='4096 87380 6291456'
+    sysctl -w net.ipv4.tcp_wmem='4096 16384 4194304'
+    sysctl -w net.ipv4.tcp_mem='378651 504868 757299'
+    sysctl -w net.core.netdev_max_backlog=1000
+    sysctl -w net.ipv4.tcp_max_syn_backlog=128
+    sysctl -w net.ipv4.tcp_tw_reuse=0
+    sysctl -w net.ipv4.tcp_fin_timeout=60
+    sysctl -w net.ipv4.tcp_keepalive_time=7200
+    sysctl -w net.ipv4.tcp_max_tw_buckets=180000
+    sysctl -w net.ipv4.tcp_syncookies=1
+    sysctl -w net.ipv4.tcp_rfc1337=0
+    sysctl -w net.ipv4.tcp_sack=1
+    sysctl -w net.ipv4.tcp_fack=1
+    sysctl -w net.ipv4.tcp_window_scaling=1
+    sysctl -w net.ipv4.tcp_adv_win_scale=1
+    sysctl -w net.ipv4.tcp_moderate_rcvbuf=1
+    sysctl -w net.core.optmem_max=20480
+    sysctl -w net.ipv4.tcp_notsent_lowat=4294967295
+    
+    # 从配置文件中移除所有自定义设置
+    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
+    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
+    sed -i '/net.core.rmem_max/d' /etc/sysctl.conf
+    sed -i '/net.core.wmem_max/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_mem/d' /etc/sysctl.conf
+    sed -i '/net.core.netdev_max_backlog/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_max_syn_backlog/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_fin_timeout/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_max_tw_buckets/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_syncookies/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_rfc1337/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_sack/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_fack/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_window_scaling/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_adv_win_scale/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_moderate_rcvbuf/d' /etc/sysctl.conf
+    sed -i '/net.core.optmem_max/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_notsent_lowat/d' /etc/sysctl.conf
+    
+    sysctl -p
+    
+    echo -e "${Yellow}端口转发加速已关闭${Font}"
+}
+
 # 显示菜单
 show_menu() {
     echo -e "${Green}========= Socat 管理脚本 ==========${Font}"
     echo "1. 添加新转发"
     echo "2. 查看或删除转发"
     echo "3. 强制终止所有 Socat 进程"
-    echo "4. 退出脚本"
+    echo "4. 开启端口转发加速"
+    echo "5. 关闭端口转发加速"
+    echo "6. 退出脚本"
     echo -e "${Green}=====================================${Font}"
 }
 
@@ -227,7 +366,7 @@ main() {
 
     while true; do
         show_menu
-        read -p "请输入选项 [1-4]: " choice
+        read -p "请输入选项 [1-6]: " choice
         clear_screen
         case $choice in
             1)
@@ -244,6 +383,14 @@ main() {
                 press_any_key
                 ;;
             4)
+                enable_acceleration
+                press_any_key
+                ;;
+            5)
+                disable_acceleration
+                press_any_key
+                ;;
+            6)
                 echo -e "${Green}感谢使用,再见!${Font}"
                 exit 0
                 ;;
