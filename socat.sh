@@ -94,7 +94,7 @@ init_config() {
     fi
 }
 
-# 添加转发到配置文件
+# 添加到配置文件
 add_to_config() {
     if [ "$ip_version" == "1" ]; then
         echo "ipv4 $port1 $socatip $port2" >> "$CONFIG_FILE"
@@ -259,29 +259,36 @@ view_delete_forward() {
 
     echo -e "${Green}当前转发列表:${Font}"
     local i=1
-    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
+    local entries=()
+    while IFS=' ' read -r ip_type listen_port remote_ip remote_port protocol; do
+        entries+=("$ip_type $listen_port $remote_ip $remote_port $protocol")
         if [ "$ip_type" == "ipv4" ]; then
-            echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port"
+            echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
         else
-            echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port"
+            echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
         fi
         ((i++))
     done < "$CONFIG_FILE"
 
     read -p "请输入要删除的转发编号（多个编号用空格分隔，直接回车取消）: " numbers
     if [ -n "$numbers" ]; then
-        for num in $numbers; do
+        local nums_to_delete=($(echo "$numbers" | tr ' ' '\n' | sort -rn))
+        for num in "${nums_to_delete[@]}"; do
             if [ $num -ge 1 ] && [ $num -lt $i ]; then
-                local line=$(sed -n "${num}p" "$CONFIG_FILE")
-                read -r ip_type listen_port remote_ip remote_port <<< "$line"
-                pkill -f "socat.*LISTEN:${listen_port}"
+                local index=$((num-1))
+                IFS=' ' read -r ip_type listen_port remote_ip remote_port protocol <<< "${entries[$index]}"
+                # 终止 TCP 和 UDP 进程
+                pkill -f "socat.*TCP.*LISTEN:${listen_port}"
+                pkill -f "socat.*UDP.*LISTEN:${listen_port}"
                 sed -i "${num}d" "$CONFIG_FILE"
                 remove_from_startup "$listen_port" "$ip_type"
                 if [ "$ip_type" == "ipv4" ]; then
-                    echo -e "${Green}已删除IPv4转发: $ip:$listen_port${Font}"
+                    echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
                 else
-                    echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port${Font}"
+                    echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port (TCP/UDP)${Font}"
                 fi
+                # 移除防火墙规则
+                remove_firewall_rules "$listen_port" "$ip_type"
             else
                 echo -e "${Red}无效的编号: $num${Font}"
             fi
@@ -357,24 +364,81 @@ configure_firewall() {
     fi
 }
 
+# 移除防火墙规则
+remove_firewall_rules() {
+    local port=$1
+    local ip_version=$2
+
+    # 检测防火墙工具
+    local firewall_tool=""
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        firewall_tool="firewalld"
+    elif command -v ufw >/dev/null 2>&1; then
+        firewall_tool="ufw"
+    elif command -v iptables >/dev/null 2>&1; then
+        firewall_tool="iptables"
+    fi
+
+    if [ -z "$firewall_tool" ]; then
+        echo -e "${Yellow}未检测到防火墙工具，跳过防火墙规则移除。${Font}"
+        return
+    fi
+
+    case $firewall_tool in
+        "firewalld")
+            if [ "$ip_version" == "ipv4" ]; then
+                firewall-cmd --zone=public --remove-port=${port}/tcp --permanent >/dev/null 2>&1
+                firewall-cmd --zone=public --remove-port=${port}/udp --permanent >/dev/null 2>&1
+            else
+                firewall-cmd --zone=public --remove-port=${port}/tcp --permanent --ipv6 >/dev/null 2>&1
+                firewall-cmd --zone=public --remove-port=${port}/udp --permanent --ipv6 >/dev/null 2>&1
+            fi
+            firewall-cmd --reload >/dev/null 2>&1
+            ;;
+        "ufw")
+            ufw delete allow ${port}/tcp >/dev/null 2>&1
+            ufw delete allow ${port}/udp >/dev/null 2>&1
+            ;;
+        "iptables")
+            if [ "$ip_version" == "ipv4" ]; then
+                iptables -D INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
+                iptables -D INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
+            else
+                ip6tables -D INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
+                ip6tables -D INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
+            fi
+            ;;
+    esac
+    echo -e "${Green}已移除端口 ${port} 的防火墙规则 (TCP/UDP)。${Font}"
+}
+
 # 启动Socat
 start_socat(){
     echo -e "${Green}正在配置Socat...${Font}"
 
     if [ "$ip_version" == "1" ]; then
-        nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> ./socat.log 2>&1 &
+        # TCP转发
+        nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> ./socat_tcp.log 2>&1 &
+        # UDP转发
+        nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> ./socat_udp.log 2>&1 &
     elif [ "$ip_version" == "2" ]; then
-        nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> ./socat.log 2>&1 &
+        # TCP转发
+        nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> ./socat_tcp.log 2>&1 &
+        # UDP转发
+        nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> ./socat_udp.log 2>&1 &
     else
         echo -e "${Red}无效的选项，退出配置。${Font}"
         return
     fi
 
-    local pid=$!
+    local tcp_pid=$!
+    local udp_pid=$(pgrep -f "socat.*UDP.*LISTEN:${port1}")
 
     sleep 2
-    if kill -0 $pid 2>/dev/null; then
-        echo -e "${Green}Socat配置成功! PID: $pid${Font}"
+    if kill -0 $tcp_pid 2>/dev/null && kill -0 $udp_pid 2>/dev/null; then
+        echo -e "${Green}Socat配置成功!${Font}"
+        echo -e "${Blue}TCP PID: $tcp_pid${Font}"
+        echo -e "${Blue}UDP PID: $udp_pid${Font}"
         echo -e "${Blue}本地端口: ${port1}${Font}"
         echo -e "${Blue}远程端口: ${port2}${Font}"
         echo -e "${Blue}远程IP: ${socatip}${Font}"
@@ -395,8 +459,9 @@ start_socat(){
         fi
     else
         echo -e "${Red}Socat启动失败，请检查配置和系统设置。${Font}"
-        echo "检查 socat.log 文件以获取更多信息。"
-        tail -n 10 ./socat.log
+        echo "检查 socat_tcp.log 和 socat_udp.log 文件以获取更多信息。"
+        tail -n 10 ./socat_tcp.log
+        tail -n 10 ./socat_udp.log
     fi
 }
 
@@ -408,13 +473,16 @@ add_to_startup() {
     fi
 
     if [ "$ip_version" == "1" ]; then
-        startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> $(pwd)/socat.log 2>&1 &"
+        tcp_startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> $(pwd)/socat_tcp.log 2>&1 &"
+        udp_startup_cmd="nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> $(pwd)/socat_udp.log 2>&1 &"
     else
-        startup_cmd="nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> $(pwd)/socat.log 2>&1 &"
+        tcp_startup_cmd="nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> $(pwd)/socat_tcp.log 2>&1 &"
+        udp_startup_cmd="nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> $(pwd)/socat_udp.log 2>&1 &"
     fi
 
-    if ! grep -q "$startup_cmd" "$rc_local"; then
-        echo "$startup_cmd" >> "$rc_local"
+    if ! grep -q "$tcp_startup_cmd" "$rc_local"; then
+        echo "$tcp_startup_cmd" >> "$rc_local"
+        echo "$udp_startup_cmd" >> "$rc_local"
         chmod +x "$rc_local"
         echo -e "${Green}已添加到开机自启动${Font}"
     else
@@ -471,11 +539,13 @@ remove_from_startup() {
     rc_local="/etc/rc.local"
     if [ -f "$rc_local" ] && [ -n "$listen_port" ] && [ -n "$ip_type" ]; then
         if [ "$ip_type" == "ipv4" ]; then
-            sed -i "/socat TCP4-LISTEN:${listen_port}/d" "$rc_local"
+            sed -i "/socat.*TCP4-LISTEN:${listen_port}/d" "$rc_local"
+            sed -i "/socat.*UDP4-LISTEN:${listen_port}/d" "$rc_local"
         elif [ "$ip_type" == "ipv6" ]; then
-            sed -i "/socat TCP6-LISTEN:${listen_port}/d" "$rc_local"
+            sed -i "/socat.*TCP6-LISTEN:${listen_port}/d" "$rc_local"
+            sed -i "/socat.*UDP6-LISTEN:${listen_port}/d" "$rc_local"
         fi
-        echo -e "${Green}已从开机自启动中移除${ip_type}端口 ${listen_port} 的转发${Font}"
+        echo -e "${Green}已从开机自启动中移除${ip_type}端口 ${listen_port} 的TCP和UDP转发${Font}"
     else
         echo -e "${Yellow}警告: 无法移除开机自启动项，可能是因为文件不存在或参数无效${Font}"
     fi
