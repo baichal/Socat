@@ -569,16 +569,82 @@ kill_all_socat() {
     echo -e "${Green}已从配置和开机自启动中移除所有 Socat 转发${Font}"
 }
 
+# 检查是否已启用BBR或其变种
+check_and_enable_bbr() {
+    echo -e "${Green}正在检查 BBR 状态...${Font}"
+
+    # 检查当前的拥塞控制算法
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+
+    # 检查可用的拥塞控制算法
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control)
+
+    # 检查当前的队列调度算法
+    current_qdisc=$(sysctl -n net.core.default_qdisc)
+
+    # 定义 BBR 及其变种的列表
+    bbr_variants=("bbr" "bbr2" "bbrplus" "tsunamy")
+
+    # 检查是否已启用 BBR 或其变种
+    if [[ " ${bbr_variants[@]} " =~ " ${current_cc} " ]]; then
+        echo -e "${Yellow}检测到系统已启用 ${current_cc}，无需重复设置。${Font}"
+        if [[ $current_qdisc != "fq" ]]; then
+            sysctl -w net.core.default_qdisc=fq
+            echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+            echo -e "${Green}队列调度算法已设置为 fq。${Font}"
+        fi
+    else
+        echo -e "${Yellow}当前拥塞控制算法为 ${current_cc}。${Font}"
+        if [[ " ${available_cc} " =~ " bbr " ]]; then
+            echo -e "${Green}BBR 可用，正在启用...${Font}"
+            sysctl -w net.ipv4.tcp_congestion_control=bbr
+            sysctl -w net.core.default_qdisc=fq
+            echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+            echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+            echo -e "${Green}BBR 已启用。${Font}"
+        else
+            echo -e "${Red}BBR 不可用，可能需要升级内核。${Font}"
+        fi
+    fi
+}
+
 # 开启端口转发加速
 enable_acceleration() {
     echo -e "${Green}正在开启端口转发加速...${Font}"
+
+        # 清理旧设置
+    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
+    sed -i '/net.core.rmem_max/d' /etc/sysctl.conf
+    sed -i '/net.core.wmem_max/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_mem/d' /etc/sysctl.conf
+    sed -i '/net.core.netdev_max_backlog/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_max_syn_backlog/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_fin_timeout/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_max_tw_buckets/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_syncookies/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_rfc1337/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_sack/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_fack/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_window_scaling/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_adv_win_scale/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_moderate_rcvbuf/d' /etc/sysctl.conf
+    sed -i '/net.core.optmem_max/d' /etc/sysctl.conf
+    sed -i '/net.ipv4.tcp_notsent_lowat/d' /etc/sysctl.conf
+
+    # 检查并启用 BBR
+    check_and_enable_bbr
 
     # 启用 TCP Fast Open
     echo 3 > /proc/sys/net/ipv4/tcp_fastopen
 
     # 优化内核参数
-    sysctl -w net.ipv4.tcp_congestion_control=bbr
-    sysctl -w net.core.default_qdisc=fq
     sysctl -w net.ipv4.tcp_slow_start_after_idle=0
     sysctl -w net.ipv4.tcp_mtu_probing=1
 
