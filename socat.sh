@@ -98,10 +98,24 @@ remove_from_config() {
     sed -i "/^$listen_port /d" "$CONFIG_FILE"
 }
 
+# 检测端口是否占用
+check_port() {
+    if netstat -tuln | grep -q ":$1 "; then
+        echo -e "${Red}错误: 端口 $1 已被占用${Font}"
+        return 1
+    fi
+    return 0
+}
+
 # 配置Socat
 config_socat(){
     echo -e "${Green}请输入Socat配置信息！${Font}"
-    read -p "请输入本地端口: " port1
+    while true; do
+        read -p "请输入本地端口: " port1
+        if check_port $port1; then
+            break
+        fi
+    done
     read -p "请输入远程端口: " port2
     read -p "请输入远程IP: " socatip
 }
@@ -110,23 +124,37 @@ config_socat(){
 start_socat(){
     echo -e "${Green}正在配置Socat...${Font}"
     nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> ./socat.log 2>&1 &
+    local pid=$!
 
-    # 检查是否成功启动
     sleep 2
-    if pgrep -f "socat.*LISTEN:${port1}.*TCP4:${socatip}:${port2}" > /dev/null; then
-        echo -e "${Green}Socat配置成功!${Font}"
+    if kill -0 $pid 2>/dev/null; then
+        echo -e "${Green}Socat配置成功! PID: $pid${Font}"
         echo -e "${Blue}本地端口: ${port1}${Font}"
         echo -e "${Blue}远程端口: ${port2}${Font}"
         echo -e "${Blue}远程IP: ${socatip}${Font}"
         echo -e "${Blue}本地服务器IP: ${ip}${Font}"
 
-        # 添加到配置文件和开机自启
         add_to_config
         add_to_startup
     else
         echo -e "${Red}Socat启动失败，请检查配置和系统设置。${Font}"
+        echo "检查 socat.log 文件以获取更多信息。"
+        tail -n 10 ./socat.log
     fi
 }
+
+configure_firewall() {
+    if [ "${OS}" == "CentOS" ]; then
+        firewall-cmd --zone=public --add-port=${port1}/tcp --permanent
+        firewall-cmd --reload
+    else
+        ufw allow ${port1}/tcp
+    fi
+    echo -e "${Green}已在防火墙中开放端口 ${port1}${Font}"
+}
+
+# 在 start_socat 函数成功启动后调用
+configure_firewall
 
 # 添加到开机自启
 add_to_startup() {
