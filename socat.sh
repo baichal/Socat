@@ -5,7 +5,7 @@ export PATH
 # ====================================================
 #    系统要求: CentOS 6+、Debian 7+、Ubuntu 14+
 #    描述: Socat 一键安装管理脚本
-#    版本: 3.3
+#    版本: 3.4
 # ====================================================
 
 Green="\033[32m"
@@ -14,8 +14,14 @@ Blue="\033[34m"
 Red="\033[31m"
 Yellow="\033[33m"
 
+# 创建 socats 目录并定义相关路径
+SOCATS_DIR="$HOME/socats"
+mkdir -p "$SOCATS_DIR"
+
 # 配置文件路径
-CONFIG_FILE="./socat_forwards.conf"
+CONFIG_FILE="$SOCATS_DIR/socat_forwards.conf"
+TCP_LOG="$SOCATS_DIR/socat_tcp.log"
+UDP_LOG="$SOCATS_DIR/socat_udp.log"
 
 # 清屏函数
 clear_screen() {
@@ -206,7 +212,6 @@ check_ipv6_support() {
     return 0
 }
 
-
 # 配置Socat
 config_socat(){
     echo -e "${Green}请选择转发类型：${Font}"
@@ -342,25 +347,30 @@ configure_firewall() {
             "firewalld")
                 if [ "$ip_version" == "ipv4" ]; then
                     firewall-cmd --zone=public --add-port=${port}/tcp --permanent >/dev/null 2>&1
+                    firewall-cmd --zone=public --add-port=${port}/udp --permanent >/dev/null 2>&1
                 else
                     firewall-cmd --zone=public --add-port=${port}/tcp --permanent --ipv6 >/dev/null 2>&1
+                    firewall-cmd --zone=public --add-port=${port}/udp --permanent --ipv6 >/dev/null 2>&1
                 fi
                 firewall-cmd --reload >/dev/null 2>&1
                 ;;
             "ufw")
                 ufw allow ${port}/tcp >/dev/null 2>&1
+                ufw allow ${port}/udp >/dev/null 2>&1
                 ;;
             "iptables")
                 if [ "$ip_version" == "ipv4" ]; then
                     iptables -I INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
+                    iptables -I INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
                 else
                     ip6tables -I INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
+                    ip6tables -I INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
                 fi
                 ;;
         esac
-        echo -e "${Green}已成功为 ${ip_version} 端口 ${port} 配置防火墙规则。${Font}"
+        echo -e "${Green}已成功为 ${ip_version} 端口 ${port} 配置防火墙规则 (TCP/UDP)。${Font}"
     else
-        echo -e "${Yellow}检测到 ${firewall_tool}，但无权限修改。请手动配置 ${ip_version} 端口 ${port} 的防火墙规则。${Font}"
+        echo -e "${Yellow}检测到 ${firewall_tool}，但无权限修改。请手动配置 ${ip_version} 端口 ${port} 的防火墙规则 (TCP/UDP)。${Font}"
     fi
 }
 
@@ -418,14 +428,14 @@ start_socat(){
 
     if [ "$ip_version" == "1" ]; then
         # TCP转发
-        nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> ./socat_tcp.log 2>&1 &
+        nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> "$TCP_LOG" 2>&1 &
         # UDP转发
-        nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> ./socat_udp.log 2>&1 &
+        nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> "$UDP_LOG" 2>&1 &
     elif [ "$ip_version" == "2" ]; then
         # TCP转发
-        nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> ./socat_tcp.log 2>&1 &
+        nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> "$TCP_LOG" 2>&1 &
         # UDP转发
-        nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> ./socat_udp.log 2>&1 &
+        nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> "$UDP_LOG" 2>&1 &
     else
         echo -e "${Red}无效的选项，退出配置。${Font}"
         return
@@ -459,9 +469,9 @@ start_socat(){
         fi
     else
         echo -e "${Red}Socat启动失败，请检查配置和系统设置。${Font}"
-        echo "检查 socat_tcp.log 和 socat_udp.log 文件以获取更多信息。"
-        tail -n 10 ./socat_tcp.log
-        tail -n 10 ./socat_udp.log
+        echo "检查 $TCP_LOG 和 $UDP_LOG 文件以获取更多信息。"
+        tail -n 10 "$TCP_LOG"
+        tail -n 10 "$UDP_LOG"
     fi
 }
 
@@ -473,11 +483,11 @@ add_to_startup() {
     fi
 
     if [ "$ip_version" == "1" ]; then
-        tcp_startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> $(pwd)/socat_tcp.log 2>&1 &"
-        udp_startup_cmd="nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> $(pwd)/socat_udp.log 2>&1 &"
+        tcp_startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> $TCP_LOG 2>&1 &"
+        udp_startup_cmd="nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> $UDP_LOG 2>&1 &"
     else
-        tcp_startup_cmd="nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> $(pwd)/socat_tcp.log 2>&1 &"
-        udp_startup_cmd="nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> $(pwd)/socat_udp.log 2>&1 &"
+        tcp_startup_cmd="nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> $TCP_LOG 2>&1 &"
+        udp_startup_cmd="nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> $UDP_LOG 2>&1 &"
     fi
 
     if ! grep -q "$tcp_startup_cmd" "$rc_local"; then
@@ -487,48 +497,6 @@ add_to_startup() {
         echo -e "${Green}已添加到开机自启动${Font}"
     else
         echo -e "${Yellow}该转发已在开机自启动列表中${Font}"
-    fi
-}
-
-# 显示和删除转发
-view_delete_forward() {
-    if [ ! -s "$CONFIG_FILE" ]; then
-        echo -e "${Red}当前没有活动的转发。${Font}"
-        return
-    fi
-
-    echo -e "${Green}当前转发列表:${Font}"
-    local i=1
-    local entries=()
-    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
-        entries+=("$ip_type $listen_port $remote_ip $remote_port")
-        if [ "$ip_type" == "ipv4" ]; then
-            echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port"
-        else
-            echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port"
-        fi
-        ((i++))
-    done < "$CONFIG_FILE"
-
-    read -p "请输入要删除的转发编号（多个编号用空格分隔，直接回车取消）: " numbers
-    if [ -n "$numbers" ]; then
-        local nums_to_delete=($(echo "$numbers" | tr ' ' '\n' | sort -rn))
-        for num in "${nums_to_delete[@]}"; do
-            if [ $num -ge 1 ] && [ $num -lt $i ]; then
-                local index=$((num-1))
-                IFS=' ' read -r ip_type listen_port remote_ip remote_port <<< "${entries[$index]}"
-                pkill -f "socat.*LISTEN:${listen_port}"
-                sed -i "${num}d" "$CONFIG_FILE"
-                remove_from_startup "$listen_port" "$ip_type"
-                if [ "$ip_type" == "ipv4" ]; then
-                    echo -e "${Green}已删除IPv4转发: $ip:$listen_port${Font}"
-                else
-                    echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port${Font}"
-                fi
-            else
-                echo -e "${Red}无效的编号: $num${Font}"
-            fi
-        done
     fi
 }
 
@@ -566,6 +534,8 @@ kill_all_socat() {
     # 清理开机自启动脚本
     sed -i '/socat TCP4-LISTEN/d' /etc/rc.local
     sed -i '/socat TCP6-LISTEN/d' /etc/rc.local
+    sed -i '/socat UDP4-LISTEN/d' /etc/rc.local
+    sed -i '/socat UDP6-LISTEN/d' /etc/rc.local
     echo -e "${Green}已从配置和开机自启动中移除所有 Socat 转发${Font}"
 }
 
@@ -612,7 +582,7 @@ check_and_enable_bbr() {
 enable_acceleration() {
     echo -e "${Green}正在开启端口转发加速...${Font}"
 
-        # 清理旧设置
+    # 清理旧设置
     sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
@@ -674,8 +644,6 @@ enable_acceleration() {
 
     # 持久化设置
     echo "net.ipv4.tcp_fastopen = 3" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-    echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
     echo "net.ipv4.tcp_slow_start_after_idle = 0" >> /etc/sysctl.conf
     echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.conf
     # 添加新增的优化参数到sysctl.conf
@@ -719,6 +687,7 @@ disable_acceleration() {
     sysctl -w net.ipv4.tcp_mtu_probing=0
 
     # 恢复其他参数到默认值
+    sysctl -w net.core.rmem_max=212992
     sysctl -w net.core.wmem_max=212992
     sysctl -w net.ipv4.tcp_rmem='4096 87380 6291456'
     sysctl -w net.ipv4.tcp_wmem='4096 16384 4194304'
@@ -808,6 +777,8 @@ main() {
 
     init_config
     clear_screen
+
+    echo -e "${Green}所有配置和日志文件将保存在: $SOCATS_DIR${Font}"
 
     while true; do
         show_menu
