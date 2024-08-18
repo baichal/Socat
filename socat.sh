@@ -774,14 +774,23 @@ disable_acceleration() {
 
 # 显示菜单
 show_menu() {
-    echo -e "${Green}========= Socat 管理脚本 ==========${Font}"
-    echo "1. 添加新转发"
-    echo "2. 查看或删除转发"
-    echo "3. 强制终止所有 Socat 进程"
-    echo "4. 开启端口转发加速"
-    echo "5. 关闭端口转发加速"
-    echo "6. 退出脚本"
-    echo -e "${Green}=====================================${Font}"
+    echo -e "${Green}
+   _____                 __
+  / ___/____  _________ _/ /_
+  \__ \/ __ \/ ___/ __ \`/ __/
+ ___/ / /_/ / /__/ /_/ / /_
+/____/\____/\___/\__,_/\__/  ${Yellow}Management Script${Font}"
+    echo -e "${Blue}==========================================${Font}"
+    echo -e "${Yellow}1.${Font} 添加新转发"
+    echo -e "${Yellow}2.${Font} 查看或删除转发"
+    echo -e "${Yellow}3.${Font} 强制终止所有 Socat 进程"
+    echo -e "${Yellow}4.${Font} 开启端口转发加速"
+    echo -e "${Yellow}5.${Font} 关闭端口转发加速"
+    echo -e "${Yellow}6.${Font} 退出脚本"
+    echo -e "${Blue}==========================================${Font}"
+    echo -e "${Green}当前 IPv4: ${ip:-未知}${Font}"
+    echo -e "${Green}当前 IPv6: ${ipv6:-未知}${Font}"
+    echo
 }
 
 # 主程序
