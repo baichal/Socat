@@ -3,9 +3,9 @@ PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
 export PATH
 
 # ====================================================
-#    系统要求: CentOS 6+、Debian 7+、Ubuntu 14+
+#    系统要求: CentOS 7+、Debian 8+、Ubuntu 16+
 #    描述: Socat 一键安装管理脚本
-#    版本: 3.4
+#    版本: 4.0
 # ====================================================
 
 Green="\033[32m"
@@ -20,8 +20,6 @@ mkdir -p "$SOCATS_DIR"
 
 # 配置文件路径
 CONFIG_FILE="$SOCATS_DIR/socat_forwards.conf"
-TCP_LOG="$SOCATS_DIR/socat_tcp.log"
-UDP_LOG="$SOCATS_DIR/socat_udp.log"
 
 # 清屏函数
 clear_screen() {
@@ -127,14 +125,8 @@ check_port() {
 # 规范化 IPv6 地址
 normalize_ipv6() {
     local ip=$1
-
-    # 转换为小写
     ip=$(echo $ip | tr '[:upper:]' '[:lower:]')
-
-    # 移除每组中的前导零
     ip=$(echo $ip | sed 's/\b0*\([0-9a-f]\)/\1/g')
-
-    # 找到最长的连续零段
     local longest_zero=""
     local current_zero=""
     local IFS=":"
@@ -151,23 +143,16 @@ normalize_ipv6() {
     if [ ${#current_zero} -gt ${#longest_zero} ]; then
         longest_zero=$current_zero
     fi
-
-    # 如果存在连续的零，用双冒号替换
     if [ -n "$longest_zero" ]; then
         ip=$(echo $ip | sed "s/$longest_zero/::/")
-        # 确保不会出现三个冒号
         ip=$(echo $ip | sed 's/:::/::/')
     fi
-
-    # 确保开头和结尾没有多余的冒号
     ip=$(echo $ip | sed 's/^://' | sed 's/:$//')
-
     echo $ip
 }
 
 # 检查是否支持IPv6
 check_ipv6_support() {
-    # 检查系统是否启用了 IPv6
     if [ ! -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
         echo -e "${Red}错误: 您的系统似乎不支持 IPv6${Font}"
         return 1
@@ -185,7 +170,6 @@ check_ipv6_support() {
         fi
     fi
 
-    # 检查系统是否有可用的 IPv6 地址
     local ipv6_addr=$(ip -6 addr show | grep -oP '(?<=inet6 )([0-9a-fA-F:]+)' | grep -v '^::1' | grep -v '^fe80' | head -n 1)
     if [ -z "$ipv6_addr" ]; then
         echo -e "${Red}错误: 未检测到可用的 IPv6 地址${Font}"
@@ -195,7 +179,6 @@ check_ipv6_support() {
         echo -e "${Green}检测到 IPv6 地址: $ipv6_addr${Font}"
     fi
 
-    # 检查 IPv6 转发是否启用
     if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding)" -eq 0 ]; then
         echo -e "${Yellow}警告: IPv6 转发当前被禁用${Font}"
         read -p "是否要启用 IPv6 转发? (y/n): " enable_forwarding
@@ -236,7 +219,6 @@ config_socat(){
     read -p "请输入远程端口: " port2
     read -p "请输入远程IP: " socatip
 
-    # 验证IP地址格式
     if [ "$ip_version" == "1" ]; then
         if ! [[ $socatip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo -e "${Red}错误: 无效的IPv4地址格式${Font}"
@@ -247,11 +229,81 @@ config_socat(){
             echo -e "${Red}错误: 无效的IPv6地址格式${Font}"
             return 1
         fi
-        # 规范化 IPv6 地址
         socatip=$(normalize_ipv6 "$socatip")
     else
         echo -e "${Red}错误: 无效的选项${Font}"
         return 1
+    fi
+}
+
+# 创建 systemd 服务文件
+create_systemd_service() {
+    local name=$1
+    local command=$2
+    cat > /etc/systemd/system/${name}.service <<EOF
+[Unit]
+Description=Socat Forwarding Service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$command
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable ${name}.service
+    systemctl start ${name}.service
+}
+
+# 启动Socat
+start_socat(){
+    echo -e "${Green}正在配置Socat...${Font}"
+
+    local service_name="socat-${port1}-${port2}"
+    local command=""
+
+    if [ "$ip_version" == "1" ]; then
+        command="/usr/bin/socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2}"
+        create_systemd_service "${service_name}-tcp" "$command"
+        command="/usr/bin/socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2}"
+        create_systemd_service "${service_name}-udp" "$command"
+    elif [ "$ip_version" == "2" ]; then
+        command="/usr/bin/socat TCP6-LISTEN:${port1},reuseaddr,fork TCP6:${socatip}:${port2}"
+        create_systemd_service "${service_name}-tcp" "$command"
+        command="/usr/bin/socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2}"
+        create_systemd_service "${service_name}-udp" "$command"
+    else
+        echo -e "${Red}无效的选项，退出配置。${Font}"
+        return
+    fi
+
+    sleep 2
+    if systemctl is-active --quiet "${service_name}-tcp" && systemctl is-active --quiet "${service_name}-udp"; then
+        echo -e "${Green}Socat配置成功!${Font}"
+        echo -e "${Blue}本地端口: ${port1}${Font}"
+        echo -e "${Blue}远程端口: ${port2}${Font}"
+        echo -e "${Blue}远程IP: ${socatip}${Font}"
+        if [ "$ip_version" == "1" ]; then
+            echo -e "${Blue}本地服务器IP: ${ip}${Font}"
+            echo -e "${Blue}IP版本: IPv4${Font}"
+        else
+            echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+            echo -e "${Blue}IP版本: IPv6${Font}"
+        fi
+
+        add_to_config
+        if [ "$ip_version" == "1" ]; then
+            configure_firewall ${port1} "ipv4"
+        else
+            configure_firewall ${port1} "ipv6"
+        fi
+    else
+        echo -e "${Red}Socat启动失败，请检查系统日志。${Font}"
+        journalctl -u "${service_name}-tcp" -u "${service_name}-udp"
     fi
 }
 
@@ -265,8 +317,8 @@ view_delete_forward() {
     echo -e "${Green}当前转发列表:${Font}"
     local i=1
     local entries=()
-    while IFS=' ' read -r ip_type listen_port remote_ip remote_port protocol; do
-        entries+=("$ip_type $listen_port $remote_ip $remote_port $protocol")
+    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
+        entries+=("$ip_type $listen_port $remote_ip $remote_port")
         if [ "$ip_type" == "ipv4" ]; then
             echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
         else
@@ -281,18 +333,14 @@ view_delete_forward() {
         for num in "${nums_to_delete[@]}"; do
             if [ $num -ge 1 ] && [ $num -lt $i ]; then
                 local index=$((num-1))
-                IFS=' ' read -r ip_type listen_port remote_ip remote_port protocol <<< "${entries[$index]}"
-                # 终止 TCP 和 UDP 进程
-                pkill -f "socat.*TCP.*LISTEN:${listen_port}"
-                pkill -f "socat.*UDP.*LISTEN:${listen_port}"
+                IFS=' ' read -r ip_type listen_port remote_ip remote_port <<< "${entries[$index]}"
+                remove_forward "$listen_port" "$ip_type"
                 sed -i "${num}d" "$CONFIG_FILE"
-                remove_from_startup "$listen_port" "$ip_type"
                 if [ "$ip_type" == "ipv4" ]; then
                     echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
                 else
                     echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port (TCP/UDP)${Font}"
                 fi
-                # 移除防火墙规则
                 remove_firewall_rules "$listen_port" "$ip_type"
             else
                 echo -e "${Red}无效的编号: $num${Font}"
@@ -301,12 +349,23 @@ view_delete_forward() {
     fi
 }
 
-# 防火墙检测
+# 移除单个转发
+remove_forward() {
+    local listen_port=$1
+    local ip_type=$2
+    local service_name="socat-${listen_port}-*"
+    systemctl stop ${service_name}
+    systemctl disable ${service_name}
+    rm -f /etc/systemd/system/${service_name}.service
+    systemctl daemon-reload
+    echo -e "${Green}已移除端口 ${listen_port} 的转发${Font}"
+}
+
+# 防火墙检测和配置
 configure_firewall() {
     local port=$1
     local ip_version=$2
 
-    # 检测防火墙工具
     local firewall_tool=""
     if command -v firewall-cmd >/dev/null 2>&1; then
         firewall_tool="firewalld"
@@ -321,7 +380,6 @@ configure_firewall() {
         return
     fi
 
-    # 检查防火墙修改权限
     local has_permission=false
     case $firewall_tool in
         "firewalld")
@@ -342,7 +400,6 @@ configure_firewall() {
     esac
 
     if [ "$has_permission" = true ]; then
-        # 配置防火墙规则
         case $firewall_tool in
             "firewalld")
                 if [ "$ip_version" == "ipv4" ]; then
@@ -379,7 +436,6 @@ remove_firewall_rules() {
     local port=$1
     local ip_version=$2
 
-    # 检测防火墙工具
     local firewall_tool=""
     if command -v firewall-cmd >/dev/null 2>&1; then
         firewall_tool="firewalld"
@@ -422,106 +478,31 @@ remove_firewall_rules() {
     echo -e "${Green}已移除端口 ${port} 的防火墙规则 (TCP/UDP)。${Font}"
 }
 
-# 启动Socat
-start_socat(){
-    echo -e "${Green}正在配置Socat...${Font}"
-
-    if [ "$ip_version" == "1" ]; then
-        # TCP转发
-        nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> "$TCP_LOG" 2>&1 &
-        # UDP转发
-        nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> "$UDP_LOG" 2>&1 &
-    elif [ "$ip_version" == "2" ]; then
-        # TCP转发
-        nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> "$TCP_LOG" 2>&1 &
-        # UDP转发
-        nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> "$UDP_LOG" 2>&1 &
-    else
-        echo -e "${Red}无效的选项，退出配置。${Font}"
-        return
-    fi
-
-    local tcp_pid=$!
-    local udp_pid=$(pgrep -f "socat.*UDP.*LISTEN:${port1}")
-
-    sleep 2
-    if kill -0 $tcp_pid 2>/dev/null && kill -0 $udp_pid 2>/dev/null; then
-        echo -e "${Green}Socat配置成功!${Font}"
-        echo -e "${Blue}TCP PID: $tcp_pid${Font}"
-        echo -e "${Blue}UDP PID: $udp_pid${Font}"
-        echo -e "${Blue}本地端口: ${port1}${Font}"
-        echo -e "${Blue}远程端口: ${port2}${Font}"
-        echo -e "${Blue}远程IP: ${socatip}${Font}"
-        if [ "$ip_version" == "1" ]; then
-            echo -e "${Blue}本地服务器IP: ${ip}${Font}"
-            echo -e "${Blue}IP版本: IPv4${Font}"
-        else
-            echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
-            echo -e "${Blue}IP版本: IPv6${Font}"
-        fi
-
-        add_to_config
-        add_to_startup
-        if [ "$ip_version" == "1" ]; then
-            configure_firewall ${port1} "ipv4"
-        else
-            configure_firewall ${port1} "ipv6"
-        fi
-    else
-        echo -e "${Red}Socat启动失败，请检查配置和系统设置。${Font}"
-        echo "检查 $TCP_LOG 和 $UDP_LOG 文件以获取更多信息。"
-        tail -n 10 "$TCP_LOG"
-        tail -n 10 "$UDP_LOG"
-    fi
-}
-
-# 添加到开机自启
-add_to_startup() {
-    rc_local="/etc/rc.local"
-    if [ ! -f "$rc_local" ]; then
-        echo '#!/bin/bash' > "$rc_local"
-    fi
-
-    if [ "$ip_version" == "1" ]; then
-        tcp_startup_cmd="nohup socat TCP4-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP4:${socatip}:${port2},keepalive,nodelay >> $TCP_LOG 2>&1 &"
-        udp_startup_cmd="nohup socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2} >> $UDP_LOG 2>&1 &"
-    else
-        tcp_startup_cmd="nohup socat TCP6-LISTEN:${port1},reuseaddr,fork,keepalive,nodelay TCP6:${socatip}:${port2},keepalive,nodelay >> $TCP_LOG 2>&1 &"
-        udp_startup_cmd="nohup socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2} >> $UDP_LOG 2>&1 &"
-    fi
-
-    if ! grep -q "$tcp_startup_cmd" "$rc_local"; then
-        echo "$tcp_startup_cmd" >> "$rc_local"
-        echo "$udp_startup_cmd" >> "$rc_local"
-        chmod +x "$rc_local"
-        echo -e "${Green}已添加到开机自启动${Font}"
-    else
-        echo -e "${Yellow}该转发已在开机自启动列表中${Font}"
-    fi
-}
-
-# 从开机自启动中移除
-remove_from_startup() {
-    local listen_port=$1
-    local ip_type=$2
-    rc_local="/etc/rc.local"
-    if [ -f "$rc_local" ] && [ -n "$listen_port" ] && [ -n "$ip_type" ]; then
-        if [ "$ip_type" == "ipv4" ]; then
-            sed -i "/socat.*TCP4-LISTEN:${listen_port}/d" "$rc_local"
-            sed -i "/socat.*UDP4-LISTEN:${listen_port}/d" "$rc_local"
-        elif [ "$ip_type" == "ipv6" ]; then
-            sed -i "/socat.*TCP6-LISTEN:${listen_port}/d" "$rc_local"
-            sed -i "/socat.*UDP6-LISTEN:${listen_port}/d" "$rc_local"
-        fi
-        echo -e "${Green}已从开机自启动中移除${ip_type}端口 ${listen_port} 的TCP和UDP转发${Font}"
-    else
-        echo -e "${Yellow}警告: 无法移除开机自启动项，可能是因为文件不存在或参数无效${Font}"
+# 恢复之前的转发
+restore_forwards() {
+    if [ -s "$CONFIG_FILE" ]; then
+        echo "正在恢复之前的转发..."
+        while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
+            local service_name="socat-${listen_port}-${remote_port}"
+            if [ "$ip_type" == "ipv4" ]; then
+                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP4:${remote_ip}:${remote_port}"
+                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP4:${remote_ip}:${remote_port}"
+            elif [ "$ip_type" == "ipv6" ]; then
+                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${remote_ip}:${remote_port}"
+                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${remote_ip}:${remote_port}"
+            fi
+            echo "已恢复转发：${listen_port} -> ${remote_ip}:${remote_port}"
+        done < "$CONFIG_FILE"
     fi
 }
 
 # 强制终止所有Socat进程
 kill_all_socat() {
     echo -e "${Yellow}正在终止所有 Socat 进程...${Font}"
+    systemctl stop 'socat-*'
+    systemctl disable 'socat-*'
+    rm -f /etc/systemd/system/socat-*.service
+    systemctl daemon-reload
     pkill -9 socat
     sleep 2
     if pgrep -f socat > /dev/null; then
@@ -529,13 +510,7 @@ kill_all_socat() {
     else
         echo -e "${Green}所有 Socat 进程已成功终止。${Font}"
     fi
-    # 清空配置文件
     > "$CONFIG_FILE"
-    # 清理开机自启动脚本
-    sed -i '/socat TCP4-LISTEN/d' /etc/rc.local
-    sed -i '/socat TCP6-LISTEN/d' /etc/rc.local
-    sed -i '/socat UDP4-LISTEN/d' /etc/rc.local
-    sed -i '/socat UDP6-LISTEN/d' /etc/rc.local
     echo -e "${Green}已从配置和开机自启动中移除所有 Socat 转发${Font}"
 }
 
@@ -543,17 +518,14 @@ kill_all_socat() {
 check_and_enable_bbr() {
     echo -e "${Green}正在检查 BBR 状态...${Font}"
 
-    # 检查内核版本
     kernel_version=$(uname -r | cut -d- -f1)
     if [[ $(echo $kernel_version 4.9 | awk '{print ($1 < $2)}') -eq 1 ]]; then
         echo -e "${Red}当前内核版本 ($kernel_version) 过低，不支持 BBR。需要 4.9 或更高版本。${Font}"
         return 1
     fi
 
-    # 检查当前的拥塞控制算法
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
 
-    # 检查是否已加载 BBR 模块
     if ! lsmod | grep -q "tcp_bbr"; then
         echo -e "${Yellow}BBR 模块未加载，正在尝试加载...${Font}"
         modprobe tcp_bbr
@@ -563,10 +535,8 @@ check_and_enable_bbr() {
         fi
     fi
 
-    # 定义 BBR 及其变种的列表
     bbr_variants=("bbr" "bbr2" "bbrplus" "tsunamy")
 
-    # 检查是否已启用 BBR 或其变种
     if [[ " ${bbr_variants[@]} " =~ " ${current_cc} " ]]; then
         echo -e "${Yellow}检测到系统已启用 ${current_cc}。${Font}"
     else
@@ -574,7 +544,6 @@ check_and_enable_bbr() {
         sysctl -w net.ipv4.tcp_congestion_control=bbr
     fi
 
-    # 检查并设置队列调度算法
     current_qdisc=$(sysctl -n net.core.default_qdisc)
     if [[ $current_qdisc != "fq" ]]; then
         echo -e "${Yellow}当前队列调度算法为 ${current_qdisc}，正在切换到 fq...${Font}"
@@ -582,14 +551,12 @@ check_and_enable_bbr() {
         echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
     fi
 
-    # 持久化 BBR 设置
     if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
         echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
     fi
 
     sysctl -p
 
-    # 最后检查是否成功启用 BBR
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
     if [[ $current_cc == "bbr" ]]; then
         echo -e "${Green}BBR 已成功启用。${Font}"
@@ -602,7 +569,6 @@ check_and_enable_bbr() {
 enable_acceleration() {
     echo -e "${Green}正在开启端口转发加速...${Font}"
 
-    # 清理旧设置
     sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
@@ -628,17 +594,13 @@ enable_acceleration() {
     sed -i '/net.core.optmem_max/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_notsent_lowat/d' /etc/sysctl.conf
 
-    # 检查并启用 BBR
     check_and_enable_bbr
 
-    # 启用 TCP Fast Open
     echo 3 > /proc/sys/net/ipv4/tcp_fastopen
 
-    # 优化内核参数
     sysctl -w net.ipv4.tcp_slow_start_after_idle=0
     sysctl -w net.ipv4.tcp_mtu_probing=1
 
-    # 新增优化参数
     sysctl -w net.core.rmem_max=26214400
     sysctl -w net.core.wmem_max=26214400
     sysctl -w net.ipv4.tcp_rmem='4096 87380 26214400'
@@ -662,11 +624,9 @@ enable_acceleration() {
     sysctl -w net.core.optmem_max=65535
     sysctl -w net.ipv4.tcp_notsent_lowat=16384
 
-    # 持久化设置
     echo "net.ipv4.tcp_fastopen = 3" >> /etc/sysctl.conf
     echo "net.ipv4.tcp_slow_start_after_idle = 0" >> /etc/sysctl.conf
     echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.conf
-    # 添加新增的优化参数到sysctl.conf
     echo "net.core.rmem_max = 26214400" >> /etc/sysctl.conf
     echo "net.core.wmem_max = 26214400" >> /etc/sysctl.conf
     echo "net.ipv4.tcp_rmem = 4096 87380 26214400" >> /etc/sysctl.conf
@@ -699,14 +659,12 @@ enable_acceleration() {
 disable_acceleration() {
     echo -e "${Yellow}正在关闭端口转发加速...${Font}"
 
-    # 恢复默认内核参数
     sysctl -w net.ipv4.tcp_fastopen=0
     sysctl -w net.ipv4.tcp_congestion_control=cubic
     sysctl -w net.core.default_qdisc=pfifo_fast
     sysctl -w net.ipv4.tcp_slow_start_after_idle=1
     sysctl -w net.ipv4.tcp_mtu_probing=0
 
-    # 恢复其他参数到默认值
     sysctl -w net.core.rmem_max=212992
     sysctl -w net.core.wmem_max=212992
     sysctl -w net.ipv4.tcp_rmem='4096 87380 6291456'
@@ -728,7 +686,6 @@ disable_acceleration() {
     sysctl -w net.core.optmem_max=20480
     sysctl -w net.ipv4.tcp_notsent_lowat=4294967295
 
-    # 从配置文件中移除所有自定义设置
     sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
     sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
     sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
@@ -796,6 +753,7 @@ main() {
     echo "Debug: CONFIG_FILE = $CONFIG_FILE"
 
     init_config
+    restore_forwards
     clear_screen
 
     echo -e "${Green}所有配置和日志文件将保存在: $SOCATS_DIR${Font}"
