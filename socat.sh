@@ -543,38 +543,58 @@ kill_all_socat() {
 check_and_enable_bbr() {
     echo -e "${Green}正在检查 BBR 状态...${Font}"
 
+    # 检查内核版本
+    kernel_version=$(uname -r | cut -d- -f1)
+    if [[ $(echo $kernel_version 4.9 | awk '{print ($1 < $2)}') -eq 1 ]]; then
+        echo -e "${Red}当前内核版本 ($kernel_version) 过低，不支持 BBR。需要 4.9 或更高版本。${Font}"
+        return 1
+    fi
+
     # 检查当前的拥塞控制算法
     current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
 
-    # 检查可用的拥塞控制算法
-    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control)
-
-    # 检查当前的队列调度算法
-    current_qdisc=$(sysctl -n net.core.default_qdisc)
+    # 检查是否已加载 BBR 模块
+    if ! lsmod | grep -q "tcp_bbr"; then
+        echo -e "${Yellow}BBR 模块未加载，正在尝试加载...${Font}"
+        modprobe tcp_bbr
+        if ! lsmod | grep -q "tcp_bbr"; then
+            echo -e "${Red}无法加载 BBR 模块。请检查您的系统是否支持 BBR。${Font}"
+            return 1
+        fi
+    fi
 
     # 定义 BBR 及其变种的列表
     bbr_variants=("bbr" "bbr2" "bbrplus" "tsunamy")
 
     # 检查是否已启用 BBR 或其变种
     if [[ " ${bbr_variants[@]} " =~ " ${current_cc} " ]]; then
-        echo -e "${Yellow}检测到系统已启用 ${current_cc}，无需重复设置。${Font}"
-        if [[ $current_qdisc != "fq" ]]; then
-            sysctl -w net.core.default_qdisc=fq
-            echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-            echo -e "${Green}队列调度算法已设置为 fq。${Font}"
-        fi
+        echo -e "${Yellow}检测到系统已启用 ${current_cc}。${Font}"
     else
-        echo -e "${Yellow}当前拥塞控制算法为 ${current_cc}。${Font}"
-        if [[ " ${available_cc} " =~ " bbr " ]]; then
-            echo -e "${Green}BBR 可用，正在启用...${Font}"
-            sysctl -w net.ipv4.tcp_congestion_control=bbr
-            sysctl -w net.core.default_qdisc=fq
-            echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-            echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
-            echo -e "${Green}BBR 已启用。${Font}"
-        else
-            echo -e "${Red}BBR 不可用，可能需要升级内核。${Font}"
-        fi
+        echo -e "${Yellow}当前拥塞控制算法为 ${current_cc}，正在切换到 BBR...${Font}"
+        sysctl -w net.ipv4.tcp_congestion_control=bbr
+    fi
+
+    # 检查并设置队列调度算法
+    current_qdisc=$(sysctl -n net.core.default_qdisc)
+    if [[ $current_qdisc != "fq" ]]; then
+        echo -e "${Yellow}当前队列调度算法为 ${current_qdisc}，正在切换到 fq...${Font}"
+        sysctl -w net.core.default_qdisc=fq
+        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+    fi
+
+    # 持久化 BBR 设置
+    if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
+        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
+    fi
+
+    sysctl -p
+
+    # 最后检查是否成功启用 BBR
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+    if [[ $current_cc == "bbr" ]]; then
+        echo -e "${Green}BBR 已成功启用。${Font}"
+    else
+        echo -e "${Red}BBR 启用失败，当前拥塞控制算法为 ${current_cc}。${Font}"
     fi
 }
 
