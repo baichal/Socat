@@ -5,7 +5,7 @@ export PATH
 # ====================================================
 #    系统要求: CentOS 7+、Debian 8+、Ubuntu 16+
 #    描述: Socat 一键安装管理脚本
-#    版本: 4.0
+#    版本: 5.0
 # ====================================================
 
 Green="\033[32m"
@@ -102,8 +102,12 @@ init_config() {
 add_to_config() {
     if [ "$ip_version" == "1" ]; then
         echo "ipv4 $port1 $socatip $port2" >> "$CONFIG_FILE"
-    else
+    elif [ "$ip_version" == "2" ]; then
         echo "ipv6 $port1 $socatip $port2" >> "$CONFIG_FILE"
+    elif [ "$ip_version" == "3" ]; then
+        echo "domain $port1 $socatip $port2" >> "$CONFIG_FILE"
+    elif [ "$ip_version" == "4" ]; then
+        echo "domain6 $port1 $socatip $port2" >> "$CONFIG_FILE"
     fi
 }
 
@@ -200,9 +204,11 @@ config_socat(){
     echo -e "${Green}请选择转发类型：${Font}"
     echo "1. IPv4 端口转发"
     echo "2. IPv6 端口转发"
-    read -p "请输入选项 [1-2]: " ip_version
+    echo "3. IPv4 域名(DDNS)端口转发"
+    echo "4. IPv6 域名(DDNS)端口转发"
+    read -p "请输入选项 [1-4]: " ip_version
 
-    if [ "$ip_version" == "2" ]; then
+    if [ "$ip_version" == "2" ] || [ "$ip_version" == "4" ]; then
         if ! check_ipv6_support; then
             echo -e "${Red}无法进行 IPv6 转发，请检查系统配置${Font}"
             return 1
@@ -217,23 +223,41 @@ config_socat(){
         fi
     done
     read -p "请输入远程端口: " port2
-    read -p "请输入远程IP: " socatip
-
-    if [ "$ip_version" == "1" ]; then
-        if ! [[ $socatip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo -e "${Red}错误: 无效的IPv4地址格式${Font}"
+    
+    if [ "$ip_version" == "3" ] || [ "$ip_version" == "4" ]; then
+        read -p "请输入远程域名: " socatip
+        if ! is_valid_domain "$socatip"; then
+            echo -e "${Red}错误: 无效的域名格式${Font}"
             return 1
         fi
-    elif [ "$ip_version" == "2" ]; then
-        if ! [[ $socatip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]]; then
-            echo -e "${Red}错误: 无效的IPv6地址格式${Font}"
-            return 1
-        fi
-        socatip=$(normalize_ipv6 "$socatip")
     else
-        echo -e "${Red}错误: 无效的选项${Font}"
-        return 1
+        read -p "请输入远程IP: " socatip
+
+        if [ "$ip_version" == "1" ]; then
+            if ! [[ $socatip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo -e "${Red}错误: 无效的IPv4地址格式${Font}"
+                return 1
+            fi
+        elif [ "$ip_version" == "2" ]; then
+            if ! [[ $socatip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]]; then
+                echo -e "${Red}错误: 无效的IPv6地址格式${Font}"
+                return 1
+            fi
+            socatip=$(normalize_ipv6 "$socatip")
+        fi
     fi
+}
+
+# 验证域名格式
+is_valid_domain() {
+    local domain=$1
+    if [[ $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+        # 尝试解析域名
+        if host "$domain" >/dev/null 2>&1 || nslookup "$domain" >/dev/null 2>&1 || dig "$domain" >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+    return 1
 }
 
 # 创建 systemd 服务文件
@@ -276,6 +300,24 @@ start_socat(){
         create_systemd_service "${service_name}-tcp" "$command"
         command="/usr/bin/socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2}"
         create_systemd_service "${service_name}-udp" "$command"
+    elif [ "$ip_version" == "3" ]; then
+        # 对于域名，默认使用IPv4，但socat会自动解析
+        command="/usr/bin/socat TCP4-LISTEN:${port1},reuseaddr,fork TCP:${socatip}:${port2}"
+        create_systemd_service "${service_name}-tcp" "$command"
+        command="/usr/bin/socat UDP4-LISTEN:${port1},reuseaddr,fork UDP:${socatip}:${port2}"
+        create_systemd_service "${service_name}-udp" "$command"
+        
+        # 设置域名IP监控
+        setup_domain_monitor "$socatip" "$port1" "domain" "$port2"
+    elif [ "$ip_version" == "4" ]; then
+        # 对于IPv6域名，使用IPv6监听并连接
+        command="/usr/bin/socat TCP6-LISTEN:${port1},reuseaddr,fork TCP6:${socatip}:${port2}"
+        create_systemd_service "${service_name}-tcp" "$command"
+        command="/usr/bin/socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2}"
+        create_systemd_service "${service_name}-udp" "$command"
+        
+        # 设置域名IP监控
+        setup_domain_monitor "$socatip" "$port1" "domain6" "$port2"
     else
         echo -e "${Red}无效的选项，退出配置。${Font}"
         return
@@ -286,17 +328,25 @@ start_socat(){
         echo -e "${Green}Socat配置成功!${Font}"
         echo -e "${Blue}本地端口: ${port1}${Font}"
         echo -e "${Blue}远程端口: ${port2}${Font}"
-        echo -e "${Blue}远程IP: ${socatip}${Font}"
+        echo -e "${Blue}远程地址: ${socatip}${Font}"
         if [ "$ip_version" == "1" ]; then
             echo -e "${Blue}本地服务器IP: ${ip}${Font}"
             echo -e "${Blue}IP版本: IPv4${Font}"
-        else
+        elif [ "$ip_version" == "2" ]; then
             echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
             echo -e "${Blue}IP版本: IPv6${Font}"
+        elif [ "$ip_version" == "3" ]; then
+            echo -e "${Blue}本地服务器IP: ${ip}${Font}"
+            echo -e "${Blue}地址类型: 域名 (DDNS, IPv4优先)${Font}"
+            echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
+        elif [ "$ip_version" == "4" ]; then
+            echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+            echo -e "${Blue}地址类型: 域名 (DDNS, IPv6优先)${Font}"
+            echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
         fi
 
         add_to_config
-        if [ "$ip_version" == "1" ]; then
+        if [ "$ip_version" == "1" ] || [ "$ip_version" == "3" ]; then
             configure_firewall ${port1} "ipv4"
         else
             configure_firewall ${port1} "ipv6"
@@ -321,8 +371,12 @@ view_delete_forward() {
         entries+=("$ip_type $listen_port $remote_ip $remote_port")
         if [ "$ip_type" == "ipv4" ]; then
             echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
-        else
+        elif [ "$ip_type" == "ipv6" ]; then
             echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+        elif [ "$ip_type" == "domain" ]; then
+            echo "$i. 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
+        elif [ "$ip_type" == "domain6" ]; then
+            echo "$i. 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
         fi
         ((i++))
     done < "$CONFIG_FILE"
@@ -338,8 +392,12 @@ view_delete_forward() {
                 sed -i "${num}d" "$CONFIG_FILE"
                 if [ "$ip_type" == "ipv4" ]; then
                     echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
-                else
+                elif [ "$ip_type" == "ipv6" ]; then
                     echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port (TCP/UDP)${Font}"
+                elif [ "$ip_type" == "domain" ]; then
+                    echo -e "${Green}已删除域名转发: $ip:$listen_port --> $remote_ip (TCP/UDP) [IPv4]${Font}"
+                elif [ "$ip_type" == "domain6" ]; then
+                    echo -e "${Green}已删除域名转发: [$ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
                 fi
                 remove_firewall_rules "$listen_port" "$ip_type"
             else
@@ -354,10 +412,18 @@ remove_forward() {
     local listen_port=$1
     local ip_type=$2
     local service_name="socat-${listen_port}-*"
+    
+    # 停止并移除socat服务
     systemctl stop ${service_name}
     systemctl disable ${service_name}
     rm -f /etc/systemd/system/${service_name}.service
     systemctl daemon-reload
+    
+    # 如果是域名类型，移除域名监控服务
+    if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+        remove_domain_monitor "$listen_port"
+    fi
+    
     echo -e "${Green}已移除端口 ${listen_port} 的转发${Font}"
 }
 
@@ -365,6 +431,13 @@ remove_forward() {
 configure_firewall() {
     local port=$1
     local ip_version=$2
+    
+    # 处理不同类型的IP版本
+    if [ "$ip_version" == "domain" ]; then
+        ip_version="ipv4"
+    elif [ "$ip_version" == "domain6" ]; then
+        ip_version="ipv6"
+    fi
 
     local firewall_tool=""
     if command -v firewall-cmd >/dev/null 2>&1; then
@@ -434,7 +507,14 @@ configure_firewall() {
 # 移除防火墙规则
 remove_firewall_rules() {
     local port=$1
-    local ip_version=$2
+    local ip_type=$2
+    
+    # 处理不同类型的IP版本
+    if [ "$ip_type" == "domain" ]; then
+        ip_type="ipv4"
+    elif [ "$ip_type" == "domain6" ]; then
+        ip_type="ipv6"
+    fi
 
     local firewall_tool=""
     if command -v firewall-cmd >/dev/null 2>&1; then
@@ -452,7 +532,7 @@ remove_firewall_rules() {
 
     case $firewall_tool in
         "firewalld")
-            if [ "$ip_version" == "ipv4" ]; then
+            if [ "$ip_type" == "ipv4" ]; then
                 firewall-cmd --zone=public --remove-port=${port}/tcp --permanent >/dev/null 2>&1
                 firewall-cmd --zone=public --remove-port=${port}/udp --permanent >/dev/null 2>&1
             else
@@ -466,7 +546,7 @@ remove_firewall_rules() {
             ufw delete allow ${port}/udp >/dev/null 2>&1
             ;;
         "iptables")
-            if [ "$ip_version" == "ipv4" ]; then
+            if [ "$ip_type" == "ipv4" ]; then
                 iptables -D INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
                 iptables -D INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
             else
@@ -490,8 +570,29 @@ restore_forwards() {
             elif [ "$ip_type" == "ipv6" ]; then
                 create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${remote_ip}:${remote_port}"
                 create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${remote_ip}:${remote_port}"
+            elif [ "$ip_type" == "domain" ]; then
+                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP:${remote_ip}:${remote_port}"
+                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP:${remote_ip}:${remote_port}"
+                # 恢复域名监控
+                setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+            elif [ "$ip_type" == "domain6" ]; then
+                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${remote_ip}:${remote_port}"
+                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${remote_ip}:${remote_port}"
+                # 恢复域名监控
+                setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
             fi
-            echo "已恢复转发：${listen_port} -> ${remote_ip}:${remote_port}"
+            
+            # 显示不同类型的转发恢复信息
+            if [ "$ip_type" == "ipv6" ] || [ "$ip_type" == "domain6" ]; then
+                echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port}"
+            else
+                echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port}"
+            fi
+            
+            # 如果是域名类型，显示监控恢复信息
+            if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+                echo "已恢复域名 ${remote_ip} 的IP监控服务"
+            fi
         done < "$CONFIG_FILE"
     fi
 }
@@ -718,6 +819,245 @@ disable_acceleration() {
     echo -e "${Yellow}端口转发加速已关闭${Font}"
 }
 
+# 设置域名监控服务
+setup_domain_monitor() {
+    local domain=$1
+    local listen_port=$2
+    local ip_type=$3
+    local remote_port=$4
+    
+    local monitor_script="$SOCATS_DIR/monitor_${listen_port}.sh"
+    
+    # 创建完整的监控脚本，直接内嵌函数定义
+    cat > "$monitor_script" <<'EOF'
+#!/bin/bash
+PATH=/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:~/bin
+export PATH
+
+# 脚本参数
+DOMAIN="$1"
+LISTEN_PORT="$2"
+IP_TYPE="$3"
+REMOTE_PORT="$4"
+SOCATS_DIR="$5"
+
+# 监控域名IP变更的函数
+monitor_domain_ip() {
+    local domain=$1
+    local listen_port=$2
+    local ip_type=$3
+    local cache_file="${SOCATS_DIR}/dns_cache_${domain//[^a-zA-Z0-9]/_}.txt"
+    local current_ip=""
+    
+    # 获取当前IP（支持IPv4和IPv6）
+    if [[ "$ip_type" == "ipv4" || "$ip_type" == "domain" ]]; then
+        # 尝试使用不同的命令解析IPv4
+        current_ip=$(host -t A "$domain" 2>/dev/null | grep "has address" | head -n1 | awk '{print $NF}')
+        if [ -z "$current_ip" ]; then
+            current_ip=$(dig +short A "$domain" 2>/dev/null | head -n1)
+        fi
+        if [ -z "$current_ip" ]; then
+            current_ip=$(nslookup "$domain" 2>/dev/null | grep -A1 "Name:" | grep "Address:" | head -n1 | awk '{print $NF}')
+        fi
+    else
+        # 尝试使用不同的命令解析IPv6
+        current_ip=$(host -t AAAA "$domain" 2>/dev/null | grep "has IPv6 address" | head -n1 | awk '{print $NF}')
+        if [ -z "$current_ip" ]; then
+            current_ip=$(dig +short AAAA "$domain" 2>/dev/null | head -n1)
+        fi
+        if [ -z "$current_ip" ]; then
+            current_ip=$(nslookup -type=AAAA "$domain" 2>/dev/null | grep -A1 "Name:" | grep "Address:" | head -n1 | awk '{print $NF}')
+        fi
+    fi
+    
+    if [ -z "$current_ip" ]; then
+        echo "无法解析域名 $domain 的IP地址" >> "${SOCATS_DIR}/dns_monitor.log"
+        return 1
+    fi
+    
+    # 如果缓存文件不存在，创建它
+    if [ ! -f "$cache_file" ]; then
+        echo "$current_ip" > "$cache_file"
+        echo "$(date): 初始化域名 $domain 的IP缓存: $current_ip" >> "${SOCATS_DIR}/dns_monitor.log"
+        return 0
+    fi
+    
+    # 读取上次缓存的IP
+    local cached_ip=$(cat "$cache_file")
+    
+    # 如果IP变更，重启服务
+    if [ "$current_ip" != "$cached_ip" ]; then
+        echo "$(date): 检测到域名 $domain 的IP变更: $cached_ip -> $current_ip" >> "${SOCATS_DIR}/dns_monitor.log"
+        echo "$current_ip" > "$cache_file"
+        
+        # 重启对应的socat服务
+        local service_name="socat-${listen_port}-*"
+        systemctl restart $service_name
+        echo "$(date): 已重启转发服务 $service_name" >> "${SOCATS_DIR}/dns_monitor.log"
+        return 0
+    fi
+    
+    return 0
+}
+
+# 执行监控
+monitor_domain_ip "$DOMAIN" "$LISTEN_PORT" "$IP_TYPE"
+EOF
+    
+    chmod +x "$monitor_script"
+    
+    # 创建systemd定时器服务
+    local timer_name="domain-monitor-${listen_port}"
+    
+    cat > /etc/systemd/system/${timer_name}.service <<EOF
+[Unit]
+Description=Domain IP Monitor Service for ${domain}
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $monitor_script "${domain}" "${listen_port}" "${ip_type}" "${remote_port}" "${SOCATS_DIR}"
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    cat > /etc/systemd/system/${timer_name}.timer <<EOF
+[Unit]
+Description=Domain IP Monitor Timer for ${domain}
+Requires=${timer_name}.service
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=300
+AccuracySec=1
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable ${timer_name}.timer
+    systemctl start ${timer_name}.timer
+    
+    echo -e "${Green}已启用域名 ${domain} 的IP监控，每5分钟检查一次变更${Font}"
+}
+
+# 移除域名监控服务
+remove_domain_monitor() {
+    local listen_port=$1
+    local timer_name="domain-monitor-${listen_port}"
+    
+    systemctl stop ${timer_name}.timer >/dev/null 2>&1
+    systemctl disable ${timer_name}.timer >/dev/null 2>&1
+    rm -f /etc/systemd/system/${timer_name}.service
+    rm -f /etc/systemd/system/${timer_name}.timer
+    rm -f "$SOCATS_DIR/monitor_${listen_port}.sh"
+    systemctl daemon-reload
+    
+    echo -e "${Green}已移除端口 ${listen_port} 的域名监控服务${Font}"
+}
+
+# 修改域名监控频率
+change_monitor_interval() {
+    if [ ! -s "$CONFIG_FILE" ]; then
+        echo -e "${Red}当前没有活动的转发。${Font}"
+        return
+    fi
+    
+    local has_domain=false
+    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
+        if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+            has_domain=true
+            break
+        fi
+    done < "$CONFIG_FILE"
+    
+    if [ "$has_domain" == "false" ]; then
+        echo -e "${Red}当前没有活动的域名转发。${Font}"
+        return
+    fi
+    
+    echo -e "${Green}当前域名转发:${Font}"
+    local i=1
+    local domain_entries=()
+    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
+        if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+            domain_entries+=("$listen_port $remote_ip $ip_type")
+            if [ "$ip_type" == "domain" ]; then
+                echo "$i. IPv4域名: $ip:$listen_port --> $remote_ip:$remote_port"
+            else
+                echo "$i. IPv6域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port"
+            fi
+            ((i++))
+        fi
+    done < "$CONFIG_FILE"
+    
+    if [ ${#domain_entries[@]} -eq 0 ]; then
+        echo -e "${Red}未找到任何域名转发。${Font}"
+        return
+    fi
+    
+    read -p "请输入要修改监控频率的域名转发编号: " num
+    if [ -z "$num" ] || ! [[ $num =~ ^[0-9]+$ ]] || [ $num -lt 1 ] || [ $num -gt ${#domain_entries[@]} ]; then
+        echo -e "${Red}无效的编号。${Font}"
+        return
+    fi
+    
+    local index=$((num-1))
+    IFS=' ' read -r port domain type <<< "${domain_entries[$index]}"
+    
+    local timer_name="domain-monitor-${port}"
+    local timer_file="/etc/systemd/system/${timer_name}.timer"
+    
+    if [ ! -f "$timer_file" ]; then
+        echo -e "${Red}找不到域名 $domain 的监控定时器。${Font}"
+        return
+    fi
+    
+    local current_interval=$(grep "OnUnitActiveSec" "$timer_file" | awk -F= '{print $2}' | tr -d '[:space:]')
+    echo -e "${Green}当前域名 $domain 的监控频率为 ${current_interval:-300s}${Font}"
+    
+    echo -e "${Yellow}请选择新的监控频率:${Font}"
+    echo "1. 1分钟 (适合频繁变更的域名)"
+    echo "2. 5分钟 (默认)"
+    echo "3. 15分钟"
+    echo "4. 30分钟"
+    echo "5. 1小时"
+    echo "6. 自定义"
+    
+    read -p "请选择 [1-6]: " choice
+    
+    local new_interval=""
+    case $choice in
+        1) new_interval="60s" ;;
+        2) new_interval="300s" ;;
+        3) new_interval="900s" ;;
+        4) new_interval="1800s" ;;
+        5) new_interval="3600s" ;;
+        6)
+            read -p "请输入自定义时间间隔 (格式: 数字+单位, 例如 10s, 5m, 1h): " custom_interval
+            if [[ $custom_interval =~ ^[0-9]+[smhd]$ ]]; then
+                new_interval=$custom_interval
+            else
+                echo -e "${Red}无效的时间格式。使用默认值300s。${Font}"
+                new_interval="300s"
+            fi
+            ;;
+        *)
+            echo -e "${Red}无效的选择。使用默认值300s。${Font}"
+            new_interval="300s"
+            ;;
+    esac
+    
+    # 更新定时器配置
+    sed -i "s/OnUnitActiveSec=.*/OnUnitActiveSec=$new_interval/" "$timer_file"
+    systemctl daemon-reload
+    systemctl restart ${timer_name}.timer
+    
+    echo -e "${Green}已将域名 $domain 的监控频率更新为 $new_interval${Font}"
+}
+
 # 显示菜单
 show_menu() {
     echo -e "${Green}
@@ -732,7 +1072,8 @@ show_menu() {
     echo -e "${Yellow}3.${Font} 强制终止所有 Socat 进程"
     echo -e "${Yellow}4.${Font} 开启端口转发加速"
     echo -e "${Yellow}5.${Font} 关闭端口转发加速"
-    echo -e "${Yellow}6.${Font} 退出脚本"
+    echo -e "${Yellow}6.${Font} 设置域名监控频率"
+    echo -e "${Yellow}7.${Font} 退出脚本"
     echo -e "${Blue}==========================================${Font}"
     echo -e "${Green}当前 IPv4: ${ip:-未知}${Font}"
     echo -e "${Green}当前 IPv6: ${ipv6:-未知}${Font}"
@@ -760,7 +1101,7 @@ main() {
 
     while true; do
         show_menu
-        read -p "请输入选项 [1-6]: " choice
+        read -p "请输入选项 [1-7]: " choice
         clear_screen
         case $choice in
             1)
@@ -788,6 +1129,10 @@ main() {
                 press_any_key
                 ;;
             6)
+                change_monitor_interval
+                press_any_key
+                ;;
+            7)
                 echo -e "${Green}感谢使用,再见!${Font}"
                 exit 0
                 ;;
