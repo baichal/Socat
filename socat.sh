@@ -5,7 +5,7 @@ export PATH
 # ====================================================
 #    系统要求: CentOS 7+、Debian 8+、Ubuntu 16+
 #    描述: Socat 一键安装管理脚本
-#    版本: 5.0
+#    版本: 5.2
 # ====================================================
 
 Green="\033[32m"
@@ -597,24 +597,6 @@ restore_forwards() {
     fi
 }
 
-# 强制终止所有Socat进程
-kill_all_socat() {
-    echo -e "${Yellow}正在终止所有 Socat 进程...${Font}"
-    systemctl stop 'socat-*'
-    systemctl disable 'socat-*'
-    rm -f /etc/systemd/system/socat-*.service
-    systemctl daemon-reload
-    pkill -9 socat
-    sleep 2
-    if pgrep -f socat > /dev/null; then
-        echo -e "${Red}警告：某些 Socat 进程可能仍在运行。请考虑手动检查。${Font}"
-    else
-        echo -e "${Green}所有 Socat 进程已成功终止。${Font}"
-    fi
-    > "$CONFIG_FILE"
-    echo -e "${Green}已从配置和开机自启动中移除所有 Socat 转发${Font}"
-}
-
 # 检查是否已启用BBR或其变种
 check_and_enable_bbr() {
     echo -e "${Green}正在检查 BBR 状态...${Font}"
@@ -1058,6 +1040,163 @@ change_monitor_interval() {
     echo -e "${Green}已将域名 $domain 的监控频率更新为 $new_interval${Font}"
 }
 
+# 显示Socat管理子菜单
+manage_socat_menu() {
+    while true; do
+        clear_screen
+        echo -e "${Green}
+   _____                 __
+  / ___/____  _________ _/ /_ 
+  \__ \/ __ \/ ___/ __ \`/ __/ 
+ ___/ / /_/ / /__/ /_/ / /_ 
+/____/\____/\___/\__,_/\__/  ${Yellow}Socat管理${Font}"
+        echo -e "${Blue}==========================================${Font}"
+        echo -e "${Yellow}1.${Font} 开启Socat"
+        echo -e "${Yellow}2.${Font} 关闭Socat"
+        echo -e "${Yellow}3.${Font} 重启Socat"
+        echo -e "${Yellow}4.${Font} 卸载Socat"
+        echo -e "${Yellow}5.${Font} 返回主菜单"
+        echo -e "${Blue}==========================================${Font}"
+        read -p "请输入选项 [1-5]: " choice
+        case $choice in
+            1)
+                echo -e "${Green}开启Socat...${Font}"
+                open_socat
+                ;; 
+            2)
+                echo -e "${Green}终止所有 Socat 进程...${Font}"
+                kill_all_socat
+                ;; 
+            3)
+                echo -e "${Green}重启Socat...${Font}"
+                re_socat
+                ;; 
+            4)
+                echo -e "${Green}卸载Socat...${Font}"
+                uninstall_socat
+                return
+                ;; 
+            5)
+                return
+                ;; 
+            *)
+                echo -e "${Red}无效的选项，请重新输入。${Font}"
+                sleep 2
+                ;; 
+        esac
+    done
+}
+
+# 开启/重新加载socat
+open_socat(){
+
+    restore_forwards
+
+}
+
+# 强制终止所有Socat进程
+kill_all_socat() {
+    echo -e "${Yellow}正在终止所有 Socat 进程...${Font}"
+    # 停止并禁用所有socat服务
+    for service_file in /etc/systemd/system/socat-*.service; do
+    if [ -f "$service_file" ]; then
+        service_name=$(basename "$service_file" .service)
+        systemctl stop "$service_name"
+        systemctl disable "$service_name"
+    fi
+done
+    rm -f /etc/systemd/system/socat-*.service
+    systemctl daemon-reload
+    pkill -9 -f "$(which socat)"
+    #pkill -9 -f "$0"
+    sleep 2
+    if pgrep -f socat > /dev/null; then
+        echo -e "${Red}警告：某些 Socat 进程可能仍在运行。请考虑手动检查。${Font}"
+    else
+        echo -e "${Green}所有 Socat 进程已成功终止。${Font}"
+    fi
+    if [[ "$1" == "uninstall" ]]; then
+        > "$CONFIG_FILE"
+        echo -e "${Green}已清空转发配置文件${Font}"
+    elif [[ "$1" != "noconfirm" ]]; then
+        read -p "是否清除Socat转发配置文件？[y/N]: " confirm
+        if [[ $confirm =~ ^[Yy]$ ]]; then
+            > "$CONFIG_FILE"
+            echo -e "${Green}已清空转发配置文件${Font}"
+        else
+            echo -e "${Yellow}已保留转发配置文件${Font}"
+        fi
+    else
+        echo -e "${Yellow}正在执行重启操作${Font}"
+    fi
+    echo -e "${Green}已从配置和开机自启动中移除所有 Socat 转发${Font}"
+}
+
+# 重启socat
+re_socat(){
+    kill_all_socat "noconfirm"
+    sleep 2
+    restore_forwards
+}
+
+# 卸载socat
+uninstall_socat() {
+    if ! command -v socat > /dev/null; then
+        echo -e "${Red}错误：系统中未安装Socat，无需执行卸载操作${Font}"
+        return 1
+    fi
+    
+    echo -e "${Yellow}正在执行彻底卸载操作...${Font}"
+    
+    # 停止并清理所有服务
+    kill_all_socat "uninstall"
+    
+    # 删除系统服务文件
+    rm -f /etc/systemd/system/socat-*.{service,timer}
+    systemctl daemon-reload
+    
+    # 删除配置目录和文件
+    rm -rf "$SOCATS_DIR"
+    [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE"
+    
+    # 卸载socat程序
+    local uninstall_success=0
+    if command -v apt-get > /dev/null; then
+        echo -e "${Yellow}正在通过apt-get卸载Socat...${Font}"
+        if apt-get remove -y socat; then
+            uninstall_success=1
+            echo -e "${Green}apt-get卸载成功${Font}"
+        else
+            echo -e "${Red}apt-get卸载失败，请手动检查${Font}"
+        fi
+    elif command -v yum > /dev/null; then
+        echo -e "${Yellow}正在通过yum卸载Socat...${Font}"
+        if yum remove -y socat; then
+            uninstall_success=1
+            echo -e "${Green}yum卸载成功${Font}"
+        else
+            echo -e "${Red}yum卸载失败，请手动检查${Font}"
+        fi
+    else
+        echo -e "${Yellow}检测到手动安装的Socat，尝试查找二进制文件...${Font}"
+        if which socat > /dev/null; then
+            local socat_path=$(which socat)
+            echo -e "${Yellow}发现Socat可执行文件: $socat_path ${Font}"
+            rm -f "$socat_path"
+            [ ! -f "$socat_path" ] && uninstall_success=1
+        fi
+    fi
+    
+    if [ $uninstall_success -eq 1 ] && ! command -v socat > /dev/null; then
+        echo -e "${Green}✅ Socat卸载验证通过${Font}"
+    else
+        echo -e "${Red}⚠️  Socat卸载未完成，请手动检查以下内容：${Font}"
+        echo -e "${Yellow}1. 检查残留文件: which socat\n2. 检查进程状态: pgrep -f socat${Font}"
+    fi
+    
+    echo -e "${Green}已成功卸载Socat及所有相关文件${Font}"
+}
+
 # 显示菜单
 show_menu() {
     echo -e "${Green}
@@ -1069,7 +1208,7 @@ show_menu() {
     echo -e "${Blue}==========================================${Font}"
     echo -e "${Yellow}1.${Font} 添加新转发"
     echo -e "${Yellow}2.${Font} 查看或删除转发"
-    echo -e "${Yellow}3.${Font} 强制终止所有 Socat 进程"
+    echo -e "${Yellow}3.${Font} Socat管理"
     echo -e "${Yellow}4.${Font} 开启端口转发加速"
     echo -e "${Yellow}5.${Font} 关闭端口转发加速"
     echo -e "${Yellow}6.${Font} 设置域名监控频率"
@@ -1089,16 +1228,20 @@ main() {
     ip=$(get_ip)
     ipv6=$(get_ipv6)
 
-    echo "Debug: IP = $ip"
-    echo "Debug: IPv6 = $ipv6"
-    echo "Debug: CONFIG_FILE = $CONFIG_FILE"
-
+    // 初始化标记检查
+    if [ ! -f "$SOCATS_DIR/.initialized" ]; then
     init_config
     restore_forwards
     clear_screen
-
+    touch "$SOCATS_DIR/.initialized"
     echo -e "${Green}所有配置和日志文件将保存在: $SOCATS_DIR${Font}"
+    fi
+    clear_screen
+    
 
+    #echo -e "${Green}所有配置和日志文件将保存在: $SOCATS_DIR${Font}"
+    
+    
     while true; do
         show_menu
         read -p "请输入选项 [1-7]: " choice
@@ -1117,8 +1260,8 @@ main() {
                 press_any_key
                 ;;
             3)
-                kill_all_socat
-                press_any_key
+                manage_socat_menu
+                clear_screen
                 ;;
             4)
                 enable_acceleration
