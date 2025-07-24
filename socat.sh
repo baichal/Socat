@@ -21,6 +21,9 @@ mkdir -p "$SOCATS_DIR"
 # 配置文件路径
 CONFIG_FILE="$SOCATS_DIR/socat_forwards.conf"
 
+# JSON格式化开关 (0=不格式化, 1=格式化)
+JSON_FORMAT_ENABLED=${JSON_FORMAT_ENABLED:-1}
+
 # 清屏函数
 clear_screen() {
     clear
@@ -41,45 +44,176 @@ check_root(){
     fi
 }
 
-# 检查系统类型
+# 系统检测逻辑
 check_sys(){
-    if [[ -f /etc/redhat-release ]]; then
-        OS="CentOS"
-    elif cat /etc/issue | grep -q -E -i "debian"; then
-        OS="Debian"
-    elif cat /etc/issue | grep -q -E -i "ubuntu"; then
-        OS="Ubuntu"
-    elif cat /etc/issue | grep -q -E -i "centos|red hat|redhat"; then
-        OS="CentOS"
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS=$ID
+        VER=$VERSION_ID
+    elif [[ -f /etc/redhat-release ]]; then
+        OS="centos"
+        VER=$(grep -oE '[0-9]+' /etc/redhat-release | head -1)
+    elif [[ -f /etc/debian_version ]]; then
+        OS="debian"
+        VER=$(cat /etc/debian_version)
     else
         echo "不支持的操作系统！"
         exit 1
     fi
+    
+    # 标准化包管理器检测
+    if command -v apt-get >/dev/null 2>&1; then
+        PKG_MANAGER="apt"
+    elif command -v yum >/dev/null 2>&1; then
+        PKG_MANAGER="yum"
+    elif command -v dnf >/dev/null 2>&1; then
+        PKG_MANAGER="dnf"
+    elif command -v pacman >/dev/null 2>&1; then
+        PKG_MANAGER="pacman"
+    else
+        echo "未找到支持的包管理器！"
+        exit 1
+    fi
 }
 
-# 获取本机IP（优化版本）
+# IP获取
 get_ip(){
-    local ip=$(ip -4 addr show | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | grep -v 127.0.0.1 | head -n1)
-    echo ${ip:-"未知IPv4"}
+    local ip=""
+    
+    # 优先使用ip命令
+    if command -v ip >/dev/null 2>&1; then
+        ip=$(ip -4 route get 8.8.8.8 2>/dev/null | awk '{print $7; exit}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    fi
+    
+    # 备选方案
+    if [[ -z "$ip" ]] && command -v hostname >/dev/null 2>&1; then
+        ip=$(hostname -I 2>/dev/null | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    fi
+    
+    echo ${ip:-"127.0.0.1"}
 }
 
-# 获取IPv6地址
+# IPv6检测和获取
 get_ipv6(){
-    local ipv6=$(ip -6 addr show | grep -oP '(?<=inet6\s)[\da-f:]+' | grep -v '^::1' | grep -v '^fe80' | head -n1)
-    echo ${ipv6:-"未知IPv6"}
+    local ipv6=""
+    
+    # 检查系统是否支持IPv6
+    if [[ ! -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] || [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -eq 1 ]]; then
+        echo ""
+        return
+    fi
+    
+    # 获取可用的全球单播IPv6地址
+    if command -v ip >/dev/null 2>&1; then
+        ipv6=$(ip -6 route get 2001:4860:4860::8888 2>/dev/null | grep -oE 'src [0-9a-fA-F:]+' | awk '{print $2}' | grep -v '^fe80' | head -n1)
+    fi
+    
+    # 备选方案
+    if [[ -z "$ipv6" ]] && command -v hostname >/dev/null 2>&1; then
+        ipv6=$(hostname -I 2>/dev/null | grep -oE '([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}' | head -n1)
+    fi
+    
+    echo ${ipv6:-""}
 }
 
-# 安装Socat（只在需要时执行）
-install_socat(){
-    if [ ! -s /usr/bin/socat ]; then
-        echo -e "${Green}正在安装 Socat...${Font}"
-        if [ "${OS}" == "CentOS" ]; then
-            yum install -y socat
+# 检查并安装jq
+install_jq(){
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${Green}检测到 jq 未安装，正在安装 jq...${Font}"
+        
+        case "$PKG_MANAGER" in
+            "yum")
+                yum install -y jq
+                ;;
+            "dnf")
+                dnf install -y jq
+                ;;
+            "apt")
+                apt-get update -y
+                apt-get install -y jq
+                ;;
+            "pacman")
+                pacman -Sy --noconfirm jq
+                ;;
+            *)
+                echo -e "${Yellow}不支持的包管理器: $PKG_MANAGER，跳过 jq 安装${Font}"
+                return 1
+                ;;
+        esac
+        
+        if command -v jq >/dev/null 2>&1; then
+            echo -e "${Green}jq 安装完成！${Font}"
+            return 0
         else
-            apt-get -y update
-            apt-get install -y socat
+            echo -e "${Red}jq 安装失败，将使用手动 JSON 解析${Font}"
+            return 1
         fi
-        if [ -s /usr/bin/socat ]; then
+    else
+        echo -e "${Green}jq 已安装，跳过安装${Font}"
+        return 0
+    fi
+}
+
+# 卸载jq
+uninstall_jq(){
+    if command -v jq >/dev/null 2>&1; then
+        echo -e "${Green}正在卸载 jq...${Font}"
+        
+        case "$PKG_MANAGER" in
+            "yum")
+                yum remove -y jq
+                ;;
+            "dnf")
+                dnf remove -y jq
+                ;;
+            "apt")
+                apt-get remove -y jq
+                ;;
+            "pacman")
+                pacman -R --noconfirm jq
+                ;;
+            *)
+                echo -e "${Red}不支持的包管理器: $PKG_MANAGER${Font}"
+                return 1
+                ;;
+        esac
+        
+        if ! command -v jq >/dev/null 2>&1; then
+            echo -e "${Green}jq 卸载完成！${Font}"
+        else
+            echo -e "${Red}jq 卸载失败${Font}"
+        fi
+    else
+        echo -e "${Yellow}jq 未安装，无需卸载${Font}"
+    fi
+}
+
+# Socat安装
+install_socat(){
+    if ! command -v socat >/dev/null 2>&1; then
+        echo -e "${Green}正在安装 Socat...${Font}"
+        
+        case "$PKG_MANAGER" in
+            "yum")
+                yum install -y socat
+                ;;
+            "dnf")
+                dnf install -y socat
+                ;;
+            "apt")
+                apt-get update -y
+                apt-get install -y socat
+                ;;
+            "pacman")
+                pacman -Sy --noconfirm socat
+                ;;
+            *)
+                echo -e "${Red}不支持的包管理器: $PKG_MANAGER${Font}"
+                exit 1
+                ;;
+        esac
+        
+        if command -v socat >/dev/null 2>&1; then
             echo -e "${Green}Socat 安装完成！${Font}"
         else
             echo -e "${Red}Socat 安装失败，请检查网络连接和系统设置。${Font}"
@@ -88,114 +222,519 @@ install_socat(){
     fi
 }
 
+# 迁移旧格式配置到JSON格式
+migrate_old_config() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo "[]" > "$CONFIG_FILE"
+        return
+    fi
+    
+    # 检查是否为JSON格式
+    if command -v jq >/dev/null 2>&1; then
+        if jq empty "$CONFIG_FILE" 2>/dev/null; then
+            return  # 已经是有效的JSON格式
+        fi
+    else
+        # 简单的JSON格式检查
+        if head -c 1 "$CONFIG_FILE" | grep -q '^\['; then
+            return  # 看起来是JSON数组
+        fi
+    fi
+    
+    echo -e "${Yellow}检测到旧格式配置文件，正在迁移到JSON格式...${Font}"
+    
+    # 创建备份
+    cp "$CONFIG_FILE" "$CONFIG_FILE.backup.$(date +%Y%m%d_%H%M%S)"
+    
+    # 迁移旧格式到JSON
+    local temp_json=$(mktemp)
+    echo "[" > "$temp_json"
+    
+    local first_entry=true
+    while IFS=' ' read -r type port1 socatip port2; do
+        if [[ -n "$type" && -n "$port1" && -n "$socatip" && -n "$port2" ]]; then
+            local forward_type=""
+            case "$type" in
+                "ipv4") forward_type="ipv4" ;;
+                "ipv6") forward_type="ipv6" ;;
+                "domain") forward_type="domain" ;;
+                "domain6") forward_type="domain6" ;;
+                *) forward_type="ipv4" ;;
+            esac
+            
+            if [[ "$first_entry" == "false" ]]; then
+                echo "," >> "$temp_json"
+            fi
+            
+            echo -n "{\"type\":\"$forward_type\",\"listen_port\":$port1,\"remote_ip\":\"$socatip\",\"remote_port\":$port2}" >> "$temp_json"
+            first_entry=false
+        fi
+    done < "$CONFIG_FILE"
+    
+    echo "]" >> "$temp_json"
+    
+    # 验证并替换
+    if command -v jq >/dev/null 2>&1; then
+        if jq empty "$temp_json" 2>/dev/null; then
+            mv "$temp_json" "$CONFIG_FILE"
+            echo -e "${Green}配置迁移完成！旧配置已备份${Font}"
+        else
+            echo -e "${Red}配置迁移失败，保留原配置${Font}"
+            rm -f "$temp_json"
+        fi
+    else
+        # 无jq时直接替换
+        mv "$temp_json" "$CONFIG_FILE"
+        echo -e "${Green}配置迁移完成！旧配置已备份${Font}"
+    fi
+}
+
+# 统一JSON格式处理函数
+format_json_config() {
+    local input_file="${1:-$CONFIG_FILE}"
+    local format_type="${2:-$JSON_FORMAT_ENABLED}"
+    
+    if [ ! -f "$input_file" ]; then
+        echo "[]" > "$input_file"
+        return 0
+    fi
+    
+    if command -v jq >/dev/null 2>&1; then
+        if [ "$format_type" -eq 1 ]; then
+            # 格式化模式 - 完全格式化
+            jq '.' "$input_file" > "$input_file.tmp" 2>/dev/null && mv "$input_file.tmp" "$input_file"
+        else
+            # 紧凑模式但每个对象单独一行，逗号放在对象后面
+            local temp_file=$(mktemp)
+            
+            # 使用jq生成紧凑格式，逗号放在对象后面
+            echo "[" > "$temp_file"
+            
+            local objects=$(jq -c '.[]' "$input_file" 2>/dev/null)
+            local count=0
+            local total=$(echo "$objects" | wc -l | tr -d ' ')
+            
+            while IFS= read -r obj; do
+                [[ -z "$obj" ]] && continue
+                count=$((count + 1))
+                
+                if [[ $count -eq $total ]]; then
+                    echo "  $obj" >> "$temp_file"
+                else
+                    echo "  $obj," >> "$temp_file"
+                fi
+            done <<< "$objects"
+            
+            echo "]" >> "$temp_file"
+            mv "$temp_file" "$input_file"
+        fi
+        return 0
+    fi
+    
+    # 无jq时的回退处理
+    if [ "$format_type" -eq 1 ]; then
+        # 使用回退方案进行格式化
+        local temp_file=$(mktemp)
+        local content=$(cat "$input_file")
+        
+        # 提取所有有效的JSON对象
+        local objects=()
+        local current_object=""
+        local brace_count=0
+        local in_object=false
+        
+        # 逐字符解析JSON
+        while IFS= read -r -n1 char; do
+            case "$char" in
+                '{')
+                    if [[ $brace_count -eq 0 ]]; then
+                        in_object=true
+                        current_object="{"
+                    else
+                        current_object="$current_object{"
+                    fi
+                    brace_count=$((brace_count + 1))
+                    ;;
+                '}')
+                    current_object="$current_object}"
+                    brace_count=$((brace_count - 1))
+                    if [[ $brace_count -eq 0 && $in_object == true ]]; then
+                        objects+=("$current_object")
+                        in_object=false
+                        current_object=""
+                    fi
+                    ;;
+                *)
+                    if [[ $in_object == true ]]; then
+                        current_object="$current_object$char"
+                    fi
+                    ;;
+            esac
+        done <<< "$content"
+        
+        # 重新构建JSON数组 - 紧凑模式但每个对象单独一行
+        echo "[" > "$temp_file"
+        
+        local first=true
+        for obj in "${objects[@]}"; do
+            # 确保对象是有效的JSON格式
+            if [[ -n "$obj" && "$obj" =~ ^\{.*\}$ ]]; then
+                # 检查是否包含必要的字段
+                if [[ "$obj" == *"\"type\""* && "$obj" == *"\"listen_port\""* && "$obj" == *"\"remote_ip\""* && "$obj" == *"\"remote_port\""* ]]; then
+                    if [[ "$first" == "true" ]]; then
+                        first=false
+                    else
+                        echo "," >> "$temp_file"
+                    fi
+                    # 紧凑模式：每个对象单独一行
+                    echo "  $obj" >> "$temp_file"
+                fi
+            fi
+        done
+        
+        echo "]" >> "$temp_file"
+        
+        # 确保格式正确：移除多余逗号、空行等
+        sed -i 's/,,/,/g' "$temp_file"
+        sed -i 's/\[,\?/[/' "$temp_file"
+        sed -i 's/\,\?\]/]/' "$temp_file"
+        sed -i 's/},\s*,/},/g' "$temp_file"
+        
+        mv "$temp_file" "$input_file"
+    else
+        # 紧凑模式但每个对象单独一行，逗号放在对象后面（无jq回退）
+        local temp_file=$(mktemp)
+        
+        # 提取现有对象并重新格式化
+        local content=$(cat "$input_file" | tr -d '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
+        # 使用sed重新格式化：紧凑但每个对象一行，逗号放在对象后面
+        echo "[" > "$temp_file"
+        
+        # 提取对象并格式化
+        local objects=$(echo "$content" | sed 's/^\[//;s/\]$//' | sed 's/},{/}\n  {/g')
+        
+        local count=0
+        local total=$(echo "$objects" | grep -c '^' || echo 0)
+        
+        while IFS= read -r obj; do
+            [[ -z "$obj" || "$obj" == "{" ]] && continue
+            
+            count=$((count + 1))
+            
+            # 确保对象格式正确
+            if [[ "$obj" != *"}" ]]; then
+                obj="$obj}"
+            fi
+            
+            # 添加对象，根据是否是最后一个决定是否添加逗号
+            if [[ $count -eq $total ]]; then
+                echo "  $obj" >> "$temp_file"
+            else
+                echo "  $obj," >> "$temp_file"
+            fi
+        done <<< "$objects"
+        
+        echo "]" >> "$temp_file"
+        mv "$temp_file" "$input_file"
+    fi
+}
+
+# 修复JSON配置文件格式（兼容旧函数名）
+fix_json_format() {
+    format_json_config "$CONFIG_FILE" "$JSON_FORMAT_ENABLED"
+}
+
 # 初始化配置文件
 init_config() {
+    migrate_old_config
     if [ ! -f "$CONFIG_FILE" ]; then
-        touch "$CONFIG_FILE"
-        echo "Debug: Created new config file: $CONFIG_FILE"
+        echo "[]" > "$CONFIG_FILE"
+        echo "Debug: Created new JSON config file: $CONFIG_FILE"
     else
         echo "Debug: Config file already exists: $CONFIG_FILE"
+        # 修复可能存在的格式问题
+        format_json_config "$CONFIG_FILE" "$JSON_FORMAT_ENABLED"
     fi
 }
 
-# 添加到配置文件
+# 添加到配置文件 (JSON格式)
 add_to_config() {
-    if [ "$ip_version" == "1" ]; then
-        echo "ipv4 $port1 $socatip $port2" >> "$CONFIG_FILE"
-    elif [ "$ip_version" == "2" ]; then
-        echo "ipv6 $port1 $socatip $port2" >> "$CONFIG_FILE"
-    elif [ "$ip_version" == "3" ]; then
-        echo "domain $port1 $socatip $port2" >> "$CONFIG_FILE"
-    elif [ "$ip_version" == "4" ]; then
-        echo "domain6 $port1 $socatip $port2" >> "$CONFIG_FILE"
+    local forward_type=""
+    case "$ip_version" in
+        1) forward_type="ipv4" ;;
+        2) forward_type="ipv6" ;;
+        3) forward_type="domain" ;;
+        4) forward_type="domain6" ;;
+    esac
+    
+    # 使用统一格式处理函数添加配置
+    local new_entry='{"type":"'$forward_type'","listen_port":'$port1',"remote_ip":"'$socatip'","remote_port":'$port2'}'
+    
+    if command -v jq >/dev/null 2>&1; then
+        jq ". += [$new_entry]" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    else
+        # 回退到简单的JSON数组追加 - 修复JSON格式问题
+        local new_entry='{"type":"'$forward_type'","listen_port":'$port1',"remote_ip":"'$socatip'","remote_port":'$port2'}'
+        
+        # 确保配置文件存在且为有效的JSON格式
+        if [ ! -s "$CONFIG_FILE" ]; then
+            echo "[$new_entry]" > "$CONFIG_FILE"
+            return
+        fi
+        
+        # 清理现有文件中的空元素和多余逗号
+        local temp_file=$(mktemp)
+        
+        # 读取并清理现有内容
+        local content=$(cat "$CONFIG_FILE" | tr -d '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
+        # 移除空数组元素和多余逗号
+        content=$(echo "$content" | sed 's/\[,\?\s*\[,\?\s*\]/[]/g')
+        content=$(echo "$content" | sed 's/\[,\?\s*,\?\s*\]/[]/g')
+        content=$(echo "$content" | sed 's/,,/,/g')
+        content=$(echo "$content" | sed 's/\[,\?/[/' | sed 's/\,\?\]/]/')
+        
+        # 如果是空数组，直接创建新数组
+        if [[ "$content" == "[]" ]]; then
+            echo "[$new_entry]" > "$CONFIG_FILE"
+            rm -f "$temp_file"
+        # 确保格式正确
+        fix_json_format
+            return
+        fi
+        
+        # 提取现有对象
+        echo "$content" | sed 's/\[\(.*\)\]/\1/' | sed 's/},{/}\n{/g' | while IFS= read -r obj; do
+            [[ -n "$obj" && "$obj" != "{" ]] && echo "$obj"
+        done > "$temp_file"
+        
+        # 构建新的JSON数组
+        echo "[" > "$CONFIG_FILE"
+        
+        local first=true
+        while IFS= read -r obj; do
+            [[ -z "$obj" || "$obj" == "{" ]] && continue
+            
+            if [[ "$first" == "true" ]]; then
+                first=false
+            else
+                echo "," >> "$CONFIG_FILE"
+            fi
+            
+            # 确保对象格式正确
+            if [[ "$obj" != *"}" ]]; then
+                obj="$obj}"
+            fi
+            echo -n "$obj" >> "$CONFIG_FILE"
+        done < "$temp_file"
+        
+        # 添加新条目
+        if [[ "$first" == "true" ]]; then
+            echo "$new_entry]" >> "$CONFIG_FILE"
+        else
+            echo "," >> "$CONFIG_FILE"
+            echo "$new_entry]" >> "$CONFIG_FILE"
+        fi
+        
+        rm -f "$temp_file"
     fi
+    
+    # 使用统一格式处理函数确保格式正确
+    format_json_config "$CONFIG_FILE" "$JSON_FORMAT_ENABLED"
 }
 
-# 从配置文件中移除转发
+# 从配置文件中移除转发 (JSON格式)
 remove_from_config() {
     local listen_port=$1
-    sed -i "/ $listen_port /d" "$CONFIG_FILE"
+    if command -v jq >/dev/null 2>&1; then
+        jq "map(select(.listen_port != $listen_port))" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    else
+        # 回退到基于行的处理 - 修复JSON格式问题
+        local temp_file=$(mktemp)
+        
+        # 读取配置文件内容
+        local json_content=$(cat "$CONFIG_FILE")
+        
+        # 提取所有有效的JSON对象
+        local entries=()
+        local entry_count=$(echo "$json_content" | grep -o '"type"' | wc -l)
+        
+        # 收集所有非空且端口不匹配的配置项
+        local first_entry=true
+        echo "[" > "$temp_file"
+        
+        # 使用更可靠的JSON解析
+        local in_entry=false
+        local entry=""
+        local brace_count=0
+        
+        while IFS= read -r line; do
+            # 跳过空行和仅包含逗号的行
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*,[[:space:]]*$ ]] && continue
+            
+            # 检测JSON对象的开始
+            if [[ "$line" =~ ^[[:space:]]*\{ ]]; then
+                in_entry=true
+                entry=""
+                brace_count=1
+            fi
+            
+            if [[ "$in_entry" == "true" ]]; then
+                entry="$entry$line"
+                # 计算大括号匹配
+                brace_count=$(echo "$line" | sed 's/[^{}]//g' | sed 's/{/\n{/g' | sed 's/}/\n}/g' | grep -c '{')
+                brace_count=$((brace_count - $(echo "$line" | sed 's/[^{}]//g' | sed 's/{/\n{/g' | sed 's/}/\n}/g' | grep -c '}')))
+                
+                if [[ $brace_count -eq 0 ]]; then
+                    # 完整的JSON对象
+                    if [[ "$entry" != *"\"listen_port\":$listen_port"* ]]; then
+                        if [[ "$first_entry" == "false" ]]; then
+                            echo "," >> "$temp_file"
+                        fi
+                        echo -n "$entry" >> "$temp_file"
+                        first_entry=false
+                    fi
+                    in_entry=false
+                    entry=""
+                fi
+            fi
+        done < <(cat "$CONFIG_FILE" | tr -d '\n' | sed 's/\[/\[\n/g' | sed 's/\]/\n\]/g' | sed 's/},{/},\n{/g')
+        
+        # 如果没有找到任何有效条目，创建空数组
+        if [[ "$first_entry" == "true" ]]; then
+            echo "]" > "$temp_file"
+        else
+            echo "" >> "$temp_file"
+            echo "]" >> "$temp_file"
+        fi
+        
+        # 清理生成的JSON
+        sed -i 's/,,/,/g' "$temp_file"  # 移除重复逗号
+        sed -i 's/\[,/[/' "$temp_file"   # 修复开头
+        sed -i 's/,\]/]/' "$temp_file"   # 修复结尾
+        
+        mv "$temp_file" "$CONFIG_FILE"
+        # 使用统一格式处理函数确保格式正确
+        format_json_config "$CONFIG_FILE" "$JSON_FORMAT_ENABLED"
+    fi
 }
 
-# 检测端口是否占用
+# 端口占用检测
 check_port() {
-    if netstat -tuln | grep -q ":$1 "; then
-        echo -e "${Red}错误: 端口 $1 已被占用${Font}"
-        return 1
+    local port=$1
+    local protocol=${2:-"tcp"}
+    
+    # 使用ss命令（优先）
+    if command -v ss >/dev/null 2>&1; then
+        if ss -${protocol:0:1}ln | grep -q ":${port} "; then
+            local process=$(ss -${protocol:0:1}lnp | grep ":${port} " | awk '{print $7}' | cut -d',' -f1 | cut -d'"' -f2 | head -n1)
+            echo -e "${Red}错误: 端口 $1 已被占用 (${process:-未知进程})${Font}"
+            return 1
+        fi
+    # 备选使用netstat
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -${protocol:0:1}uln | grep -q ":${port} "; then
+            local process=$(netstat -${protocol:0:1}ulnp | grep ":${port} " | awk '{print $7}' | cut -d'/' -f2 | head -n1)
+            echo -e "${Red}错误: 端口 $1 已被占用 (${process:-未知进程})${Font}"
+            return 1
+        fi
     fi
+    
     return 0
 }
 
 # 规范化 IPv6 地址
 normalize_ipv6() {
     local ip=$1
-    ip=$(echo $ip | tr '[:upper:]' '[:lower:]')
-    ip=$(echo $ip | sed 's/\b0*\([0-9a-f]\)/\1/g')
-    local longest_zero=""
-    local current_zero=""
-    local IFS=":"
-    for group in $ip; do
-        if [ "$group" = "0" ]; then
-            current_zero="$current_zero:"
-        else
-            if [ ${#current_zero} -gt ${#longest_zero} ]; then
-                longest_zero=$current_zero
-            fi
-            current_zero=""
-        fi
-    done
-    if [ ${#current_zero} -gt ${#longest_zero} ]; then
-        longest_zero=$current_zero
+    
+    # 使用系统工具标准化IPv6地址
+    if command -v ipcalc >/dev/null 2>&1; then
+        local normalized=$(ipcalc -i "$ip" 2>/dev/null | grep -oE '([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}' | head -n1)
+        [[ -n "$normalized" ]] && echo "$normalized" && return
     fi
-    if [ -n "$longest_zero" ]; then
-        ip=$(echo $ip | sed "s/$longest_zero/::/")
-        ip=$(echo $ip | sed 's/:::/::/')
+    
+    # 备选方案：使用python3
+    if command -v python3 >/dev/null 2>&1; then
+        local normalized=$(python3 -c "
+import ipaddress
+import sys
+try:
+    ip = ipaddress.IPv6Address('$ip')
+    print(str(ip))
+except:
+    sys.exit(1)
+" 2>/dev/null)
+        [[ -n "$normalized" ]] && echo "$normalized" && return
     fi
-    ip=$(echo $ip | sed 's/^://' | sed 's/:$//')
-    echo $ip
+    
+    # 最后备选：简化处理
+    echo "$ip"
 }
 
 # 检查是否支持IPv6
 check_ipv6_support() {
-    if [ ! -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]; then
-        echo -e "${Red}错误: 您的系统似乎不支持 IPv6${Font}"
+    # 检查内核IPv6支持
+    if [[ ! -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]]; then
+        echo -e "${Red}错误: 您的内核不支持 IPv6${Font}"
         return 1
     fi
-
-    if [ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" -eq 1 ]; then
+    
+    # 检查IPv6模块是否加载
+    if ! lsmod | grep -q ipv6; then
+        echo -e "${Yellow}警告: IPv6 模块未加载，尝试加载...${Font}"
+        modprobe ipv6 2>/dev/null || {
+            echo -e "${Red}无法加载 IPv6 模块${Font}"
+            return 1
+        }
+    fi
+    
+    # 检查并启用IPv6
+    if [[ $(cat /proc/sys/net/ipv6/conf/all/disable_ipv6) -eq 1 ]]; then
         echo -e "${Yellow}警告: IPv6 当前被禁用${Font}"
         read -p "是否要启用 IPv6? (y/n): " enable_ipv6
         if [[ $enable_ipv6 =~ ^[Yy]$ ]]; then
-            sysctl -w net.ipv6.conf.all.disable_ipv6=0
+            # 启用IPv6
+            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+            echo "net.ipv6.conf.all.disable_ipv6=0" >> /etc/sysctl.conf
+            echo "net.ipv6.conf.default.disable_ipv6=0" >> /etc/sysctl.conf
             echo -e "${Green}IPv6 已启用${Font}"
         else
             echo -e "${Red}IPv6 保持禁用状态，无法进行 IPv6 转发${Font}"
             return 1
         fi
     fi
-
-    local ipv6_addr=$(ip -6 addr show | grep -oP '(?<=inet6 )([0-9a-fA-F:]+)' | grep -v '^::1' | grep -v '^fe80' | head -n 1)
-    if [ -z "$ipv6_addr" ]; then
+    
+    # 检查网络接口IPv6地址
+    local ipv6_addr=""
+    if command -v ip >/dev/null 2>&1; then
+        ipv6_addr=$(ip -6 addr show scope global 2>/dev/null | grep -oE 'inet6 ([0-9a-fA-F:]+)' | awk '{print $2}' | cut -d'/' -f1 | grep -v '^::1' | head -n1)
+    fi
+    
+    if [[ -z "$ipv6_addr" ]]; then
         echo -e "${Red}错误: 未检测到可用的 IPv6 地址${Font}"
         echo -e "${Yellow}请确保您的网络接口已配置 IPv6 地址${Font}"
         return 1
     else
         echo -e "${Green}检测到 IPv6 地址: $ipv6_addr${Font}"
     fi
-
-    if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding)" -eq 0 ]; then
+    
+    # 检查并启用IPv6转发
+    if [[ $(cat /proc/sys/net/ipv6/conf/all/forwarding) -eq 0 ]]; then
         echo -e "${Yellow}警告: IPv6 转发当前被禁用${Font}"
         read -p "是否要启用 IPv6 转发? (y/n): " enable_forwarding
         if [[ $enable_forwarding =~ ^[Yy]$ ]]; then
-            sysctl -w net.ipv6.conf.all.forwarding=1
+            sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.forwarding=1 >/dev/null 2>&1
             echo "net.ipv6.conf.all.forwarding=1" >> /etc/sysctl.conf
+            echo "net.ipv6.conf.default.forwarding=1" >> /etc/sysctl.conf
             echo -e "${Green}IPv6 转发已启用${Font}"
         else
-            echo -e "${Red}IPv6 转发保持禁用状态，可能影响转发功能${Font}"
-            return 1
+            echo -e "${Yellow}IPv6 转发保持禁用状态，可能影响转发功能${Font}"
         fi
     fi
-
+    
     return 0
 }
 
@@ -206,7 +745,13 @@ config_socat(){
     echo "2. IPv6 端口转发"
     echo "3. IPv4 域名(DDNS)端口转发"
     echo "4. IPv6 域名(DDNS)端口转发"
-    read -p "请输入选项 [1-4]: " ip_version
+    read -p "请输入选项 [1-4] (回车返回主菜单): " ip_version
+    
+    # 检查空输入，回车返回主菜单
+    if [[ -z "$ip_version" ]]; then
+        echo -e "${Yellow}已取消操作，返回主菜单...${Font}"
+        return 1
+    fi
 
     if [ "$ip_version" == "2" ] || [ "$ip_version" == "4" ]; then
         if ! check_ipv6_support; then
@@ -217,46 +762,113 @@ config_socat(){
 
     echo -e "${Green}请输入Socat配置信息！${Font}"
     while true; do
-        read -p "请输入本地端口: " port1
-        if check_port $port1; then
-            break
+        read -p "请输入本地端口 (留空随机分配): " port1
+        if [[ -z "$port1" ]]; then
+            echo -e "${Yellow}正在为您分配随机端口...${Font}"
+            port1=$(get_random_unused_port)
+            if [[ -n "$port1" ]]; then
+                echo -e "${Green}已分配随机端口: $port1${Font}"
+                break
+            else
+                continue
+            fi
+        elif [[ "$port1" =~ ^[0-9]+$ ]] && [[ $port1 -ge 1 ]] && [[ $port1 -le 65535 ]]; then
+            if check_port $port1; then
+                break
+            fi
+        else
+            echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
         fi
     done
-    read -p "请输入远程端口: " port2
+    while true; do
+        read -p "请输入远程端口: " port2
+        if [[ -z "$port2" ]]; then
+            echo -e "${Red}错误: 远程端口不能为空${Font}"
+            continue
+        elif [[ "$port2" =~ ^[0-9]+$ ]] && [[ $port2 -ge 1 ]] && [[ $port2 -le 65535 ]]; then
+            break
+        else
+            echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
+        fi
+    done
     
     if [ "$ip_version" == "3" ] || [ "$ip_version" == "4" ]; then
-        read -p "请输入远程域名: " socatip
-        if ! is_valid_domain "$socatip"; then
-            echo -e "${Red}错误: 无效的域名格式${Font}"
-            return 1
-        fi
+        while true; do
+            read -p "请输入远程域名: " socatip
+            if validate_domain_name "$socatip"; then
+                break
+            fi
+        done
     else
-        read -p "请输入远程IP: " socatip
-
-        if [ "$ip_version" == "1" ]; then
-            if ! [[ $socatip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                echo -e "${Red}错误: 无效的IPv4地址格式${Font}"
-                return 1
+        while true; do
+            read -p "请输入远程IP: " socatip
+            if validate_ip_address "$socatip" "$ip_version"; then
+                if [ "$ip_version" == "2" ]; then
+                    socatip=$(normalize_ipv6 "$socatip")
+                fi
+                break
             fi
-        elif [ "$ip_version" == "2" ]; then
-            if ! [[ $socatip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]]; then
-                echo -e "${Red}错误: 无效的IPv6地址格式${Font}"
-                return 1
-            fi
-            socatip=$(normalize_ipv6 "$socatip")
-        fi
+        done
     fi
 }
 
-# 验证域名格式
-is_valid_domain() {
+# IP地址验证函数
+validate_ip_address() {
+    local ip=$1
+    local ip_version=$2
+    
+    case "$ip_version" in
+        1)
+            if ! [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo -e "${Red}错误: 无效的IPv4地址格式${Font}"
+                return 1
+            fi
+            ;;
+        2)
+            if ! [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]]; then
+                echo -e "${Red}错误: 无效的IPv6地址格式${Font}"
+                return 1
+            fi
+            ;;
+    esac
+    return 0
+}
+
+# 域名验证函数
+validate_domain_name() {
     local domain=$1
-    if [[ $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
-        # 尝试解析域名
-        if host "$domain" >/dev/null 2>&1 || nslookup "$domain" >/dev/null 2>&1 || dig "$domain" >/dev/null 2>&1; then
+    
+    if ! [[ $domain =~ ^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$ ]]; then
+        echo -e "${Red}错误: 无效的域名格式${Font}"
+        return 1
+    fi
+    
+    # 尝试解析域名
+    if ! host "$domain" >/dev/null 2>&1 && ! nslookup "$domain" >/dev/null 2>&1 && ! dig "$domain" >/dev/null 2>&1; then
+        echo -e "${Red}错误: 无法解析域名${Font}"
+        return 1
+    fi
+    
+    return 0
+}
+
+# 获取随机未使用的端口
+get_random_unused_port() {
+    local min_port=1024
+    local max_port=65535
+    local max_attempts=100
+    local attempts=0
+    
+    while [[ $attempts -lt $max_attempts ]]; do
+        local port=$((RANDOM % (max_port - min_port + 1) + min_port))
+        if check_port $port; then
+            echo $port
             return 0
         fi
-    fi
+        ((attempts++))
+    done
+    
+    echo -e "${Red}错误: 无法找到可用的随机端口${Font}"
     return 1
 }
 
@@ -283,83 +895,139 @@ EOF
     systemctl start ${name}.service
 }
 
-# 启动Socat
+# 创建单个Socat服务
+create_single_socat_service() {
+    local protocol=$1  # tcp/udp
+    local ip_version=$2  # 4/6
+    local listen_port=$3
+    local target_ip=$4
+    local target_port=$5
+    local service_suffix=$6  # 用于服务名
+    
+    local service_name="socat-${listen_port}-${target_port}-${protocol}"
+    local socat_cmd=""
+    
+    # 根据IP版本和协议构建socat命令
+    if [ "$ip_version" == "4" ]; then
+        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP4:${target_ip}:${target_port}"
+        if [ "$protocol" == "udp" ]; then
+            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP4:${target_ip}:${target_port}"
+        fi
+    elif [ "$ip_version" == "6" ]; then
+        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${target_ip}:${target_port}"
+        if [ "$protocol" == "udp" ]; then
+            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${target_ip}:${target_port}"
+        fi
+    elif [ "$ip_version" == "domain" ]; then
+        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP:${target_ip}:${target_port}"
+        if [ "$protocol" == "udp" ]; then
+            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP:${target_ip}:${target_port}"
+        fi
+    elif [ "$ip_version" == "domain6" ]; then
+        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${target_ip}:${target_port}"
+        if [ "$protocol" == "udp" ]; then
+            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${target_ip}:${target_port}"
+        fi
+    fi
+    
+    create_systemd_service "$service_name" "$socat_cmd"
+}
+
+# 启动Socat - 重构后的版本
 start_socat(){
     echo -e "${Green}正在配置Socat...${Font}"
 
-    local service_name="socat-${port1}-${port2}"
-    local command=""
-
-    if [ "$ip_version" == "1" ]; then
-        command="/usr/bin/socat TCP4-LISTEN:${port1},reuseaddr,fork TCP4:${socatip}:${port2}"
-        create_systemd_service "${service_name}-tcp" "$command"
-        command="/usr/bin/socat UDP4-LISTEN:${port1},reuseaddr,fork UDP4:${socatip}:${port2}"
-        create_systemd_service "${service_name}-udp" "$command"
-    elif [ "$ip_version" == "2" ]; then
-        command="/usr/bin/socat TCP6-LISTEN:${port1},reuseaddr,fork TCP6:${socatip}:${port2}"
-        create_systemd_service "${service_name}-tcp" "$command"
-        command="/usr/bin/socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2}"
-        create_systemd_service "${service_name}-udp" "$command"
-    elif [ "$ip_version" == "3" ]; then
-        # 对于域名，默认使用IPv4，但socat会自动解析
-        command="/usr/bin/socat TCP4-LISTEN:${port1},reuseaddr,fork TCP:${socatip}:${port2}"
-        create_systemd_service "${service_name}-tcp" "$command"
-        command="/usr/bin/socat UDP4-LISTEN:${port1},reuseaddr,fork UDP:${socatip}:${port2}"
-        create_systemd_service "${service_name}-udp" "$command"
-        
-        # 设置域名IP监控
-        setup_domain_monitor "$socatip" "$port1" "domain" "$port2"
-    elif [ "$ip_version" == "4" ]; then
-        # 对于IPv6域名，使用IPv6监听并连接
-        command="/usr/bin/socat TCP6-LISTEN:${port1},reuseaddr,fork TCP6:${socatip}:${port2}"
-        create_systemd_service "${service_name}-tcp" "$command"
-        command="/usr/bin/socat UDP6-LISTEN:${port1},reuseaddr,fork UDP6:${socatip}:${port2}"
-        create_systemd_service "${service_name}-udp" "$command"
-        
-        # 设置域名IP监控
-        setup_domain_monitor "$socatip" "$port1" "domain6" "$port2"
-    else
-        echo -e "${Red}无效的选项，退出配置。${Font}"
-        return
+    local ip_type_num=""
+    local firewall_type=""
+    
+    # 根据IP版本类型设置参数
+    case "$ip_version" in
+        1)
+            ip_type_num="4"
+            firewall_type="ipv4"
+            ;;
+        2)
+            ip_type_num="6"
+            firewall_type="ipv6"
+            ;;
+        3)
+            ip_type_num="domain"
+            firewall_type="ipv4"
+            ;;
+        4)
+            ip_type_num="domain6"
+            firewall_type="ipv6"
+            ;;
+        *)
+            echo -e "${Red}无效的选项，退出配置。${Font}"
+            return 1
+            ;;
+    esac
+    
+    # 统一创建TCP和UDP服务
+    create_single_socat_service "tcp" "$ip_type_num" "$port1" "$socatip" "$port2"
+    create_single_socat_service "udp" "$ip_type_num" "$port1" "$socatip" "$port2"
+    
+    # 如果是域名类型，设置监控
+    if [ "$ip_version" == "3" ] || [ "$ip_version" == "4" ]; then
+        setup_domain_monitor "$socatip" "$port1" "$ip_type_num" "$port2"
     fi
 
     sleep 2
-    if systemctl is-active --quiet "${service_name}-tcp" && systemctl is-active --quiet "${service_name}-udp"; then
+    local service_name_tcp="socat-${port1}-${port2}-tcp"
+    local service_name_udp="socat-${port1}-${port2}-udp"
+    
+    if systemctl is-active --quiet "$service_name_tcp" && systemctl is-active --quiet "$service_name_udp"; then
         echo -e "${Green}Socat配置成功!${Font}"
         echo -e "${Blue}本地端口: ${port1}${Font}"
         echo -e "${Blue}远程端口: ${port2}${Font}"
         echo -e "${Blue}远程地址: ${socatip}${Font}"
-        if [ "$ip_version" == "1" ]; then
-            echo -e "${Blue}本地服务器IP: ${ip}${Font}"
-            echo -e "${Blue}IP版本: IPv4${Font}"
-        elif [ "$ip_version" == "2" ]; then
-            echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
-            echo -e "${Blue}IP版本: IPv6${Font}"
-        elif [ "$ip_version" == "3" ]; then
-            echo -e "${Blue}本地服务器IP: ${ip}${Font}"
-            echo -e "${Blue}地址类型: 域名 (DDNS, IPv4优先)${Font}"
-            echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
-        elif [ "$ip_version" == "4" ]; then
-            echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
-            echo -e "${Blue}地址类型: 域名 (DDNS, IPv6优先)${Font}"
-            echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
-        fi
+        
+        # 统一的显示信息
+        case "$ip_version" in
+            1)
+                echo -e "${Blue}本地服务器IP: ${ip}${Font}"
+                echo -e "${Blue}IP版本: IPv4${Font}"
+                ;;
+            2)
+                echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+                echo -e "${Blue}IP版本: IPv6${Font}"
+                ;;
+            3)
+                echo -e "${Blue}本地服务器IP: ${ip}${Font}"
+                echo -e "${Blue}地址类型: 域名 (DDNS, IPv4优先)${Font}"
+                echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
+                ;;
+            4)
+                echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+                echo -e "${Blue}地址类型: 域名 (DDNS, IPv6优先)${Font}"
+                echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
+                ;;
+        esac
 
         add_to_config
-        if [ "$ip_version" == "1" ] || [ "$ip_version" == "3" ]; then
-            configure_firewall ${port1} "ipv4"
-        else
-            configure_firewall ${port1} "ipv6"
-        fi
+        configure_firewall ${port1} "$firewall_type"
+        return 0
     else
         echo -e "${Red}Socat启动失败，请检查系统日志。${Font}"
-        journalctl -u "${service_name}-tcp" -u "${service_name}-udp"
+        journalctl -u "$service_name_tcp" -u "$service_name_udp"
+        return 1
     fi
 }
 
 # 显示和删除转发
 view_delete_forward() {
-    if [ ! -s "$CONFIG_FILE" ]; then
+    clear_screen
+    
+    # 检查配置文件是否存在或是否为空
+    if [ ! -f "$CONFIG_FILE" ]; then
+        echo -e "${Red}当前没有活动的转发。${Font}"
+        return
+    fi
+    
+    # 检查配置内容是否为空数组
+    local config_content=$(cat "$CONFIG_FILE" | tr -d '[:space:]')
+    if [ -z "$config_content" ] || [ "$config_content" = "[]" ]; then
         echo -e "${Red}当前没有活动的转发。${Font}"
         return
     fi
@@ -367,19 +1035,65 @@ view_delete_forward() {
     echo -e "${Green}当前转发列表:${Font}"
     local i=1
     local entries=()
-    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
-        entries+=("$ip_type $listen_port $remote_ip $remote_port")
-        if [ "$ip_type" == "ipv4" ]; then
-            echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
-        elif [ "$ip_type" == "ipv6" ]; then
-            echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
-        elif [ "$ip_type" == "domain" ]; then
-            echo "$i. 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
-        elif [ "$ip_type" == "domain6" ]; then
-            echo "$i. 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
-        fi
-        ((i++))
-    done < "$CONFIG_FILE"
+    
+    if command -v jq >/dev/null 2>&1; then
+        # 使用jq解析JSON配置
+        local configs=$(jq -c '.[]' "$CONFIG_FILE")
+        while IFS= read -r config; do
+            local ip_type=$(echo "$config" | jq -r '.type')
+            local listen_port=$(echo "$config" | jq -r '.listen_port')
+            local remote_ip=$(echo "$config" | jq -r '.remote_ip')
+            local remote_port=$(echo "$config" | jq -r '.remote_port')
+            
+            entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            case "$ip_type" in
+                "ipv4")
+                    echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
+                    ;;
+                "ipv6")
+                    echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    ;;
+                "domain")
+                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
+                    ;;
+                "domain6")
+                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    ;;
+            esac
+            ((i++))
+        done <<< "$configs"
+    else
+        # 回退到基于行的JSON解析
+        local json_content=$(cat "$CONFIG_FILE")
+        local count=$(echo "$json_content" | grep -o '"type"' | wc -l)
+        
+        for j in $(seq 0 $(($count-1))); do
+            local config=$(echo "$json_content" | sed -n 's/.*{\([^}]*\)}.*/\1/p' | sed -n "$((j+1))p")
+            local ip_type=$(echo "$config" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+            local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
+            local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
+            local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
+            
+            [ -z "$ip_type" ] && continue
+            
+            entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            case "$ip_type" in
+                "ipv4")
+                    echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
+                    ;;
+                "ipv6")
+                    echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    ;;
+                "domain")
+                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
+                    ;;
+                "domain6")
+                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    ;;
+            esac
+            ((i++))
+        done
+    fi
 
     read -p "请输入要删除的转发编号（多个编号用空格分隔，直接回车取消）: " numbers
     if [ -n "$numbers" ]; then
@@ -389,16 +1103,31 @@ view_delete_forward() {
                 local index=$((num-1))
                 IFS=' ' read -r ip_type listen_port remote_ip remote_port <<< "${entries[$index]}"
                 remove_forward "$listen_port" "$ip_type"
-                sed -i "${num}d" "$CONFIG_FILE"
-                if [ "$ip_type" == "ipv4" ]; then
-                    echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
-                elif [ "$ip_type" == "ipv6" ]; then
-                    echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port (TCP/UDP)${Font}"
-                elif [ "$ip_type" == "domain" ]; then
-                    echo -e "${Green}已删除域名转发: $ip:$listen_port --> $remote_ip (TCP/UDP) [IPv4]${Font}"
-                elif [ "$ip_type" == "domain6" ]; then
-                    echo -e "${Green}已删除域名转发: [$ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
+                
+                # 从JSON配置中删除
+                if command -v jq >/dev/null 2>&1; then
+                    jq --arg port "$listen_port" 'del(.[] | select(.listen_port == ($port | tonumber)))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                else
+                    # 回退到基于sed的删除
+                    local json_content=$(cat "$CONFIG_FILE")
+                    local new_content=$(echo "$json_content" | sed 's/{[^}]*"listen_port":'$listen_port'[^}]*},\?//g')
+                    echo "$new_content" > "$CONFIG_FILE"
                 fi
+                
+                case "$ip_type" in
+                    "ipv4")
+                        echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
+                        ;;
+                    "ipv6")
+                        echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port (TCP/UDP)${Font}"
+                        ;;
+                    "domain")
+                        echo -e "${Green}已删除IPv4 域名转发: $ip:$listen_port --> $remote_ip (TCP/UDP) [IPv4]${Font}"
+                        ;;
+                    "domain6")
+                        echo -e "${Green}已删除IPv6 域名转发: [$ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
+                        ;;
+                esac
                 remove_firewall_rules "$listen_port" "$ip_type"
             else
                 echo -e "${Red}无效的编号: $num${Font}"
@@ -432,76 +1161,80 @@ configure_firewall() {
     local port=$1
     local ip_version=$2
     
-    # 处理不同类型的IP版本
-    if [ "$ip_version" == "domain" ]; then
-        ip_version="ipv4"
-    elif [ "$ip_version" == "domain6" ]; then
-        ip_version="ipv6"
-    fi
-
-    local firewall_tool=""
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall_tool="firewalld"
-    elif command -v ufw >/dev/null 2>&1; then
-        firewall_tool="ufw"
-    elif command -v iptables >/dev/null 2>&1; then
-        firewall_tool="iptables"
-    fi
-
-    if [ -z "$firewall_tool" ]; then
+    # 标准化IP版本参数
+    case "$ip_version" in
+        domain|ipv4) ip_version="ipv4" ;;
+        domain6|ipv6) ip_version="ipv6" ;;
+    esac
+    
+    # 检测防火墙类型和状态
+    local firewall_type=$(detect_firewall)
+    [[ -z "$firewall_type" ]] && {
         echo -e "${Yellow}未检测到防火墙工具，端口 ${port} 配置完成。${Font}"
-        return
+        return 0
+    }
+    
+    # 统一配置防火墙规则
+    if configure_firewall_rules "$firewall_type" "$port" "$ip_version"; then
+        echo -e "${Green}已为 ${ip_version} 端口 ${port} 配置防火墙规则 (TCP/UDP)${Font}"
+    else
+        echo -e "${Yellow}防火墙配置失败或无权限，请手动配置端口 ${port}${Font}"
     fi
+}
 
-    local has_permission=false
-    case $firewall_tool in
-        "firewalld")
-            if firewall-cmd --state >/dev/null 2>&1; then
-                has_permission=true
-            fi
+# 检测防火墙类型
+detect_firewall() {
+    local firewall_type=""
+    
+    # 检测防火墙状态
+    if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        firewall_type="firewalld"
+    elif command -v ufw >/dev/null 2>&1 && ufw status >/dev/null 2>&1; then
+        firewall_type="ufw"
+    elif command -v iptables >/dev/null 2>&1; then
+        firewall_type="iptables"
+    fi
+    
+    echo "$firewall_type"
+}
+
+# 统一的防火墙规则配置
+configure_firewall_rules() {
+    local firewall_type=$1
+    local port=$2
+    local ip_version=$3
+    
+    case "$firewall_type" in
+        firewalld)
+            local zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "public")
+            local ipv6_flag=""
+            [[ "$ip_version" == "ipv6" ]] && ipv6_flag="--ipv6"
+            
+            for protocol in tcp udp; do
+                firewall-cmd --zone="$zone" --add-port="${port}/${protocol}" --permanent $ipv6_flag 2>/dev/null || return 1
+            done
+            firewall-cmd --reload 2>/dev/null || return 1
             ;;
-        "ufw")
-            if ufw status >/dev/null 2>&1; then
-                has_permission=true
-            fi
+        ufw)
+            for protocol in tcp udp; do
+                ufw allow "${port}/${protocol}" 2>/dev/null || return 1
+            done
             ;;
-        "iptables")
-            if iptables -L >/dev/null 2>&1; then
-                has_permission=true
-            fi
+        iptables)
+            local cmd="iptables"
+            [[ "$ip_version" == "ipv6" ]] && cmd="ip6tables"
+            
+            for protocol in tcp udp; do
+                $cmd -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || \
+                $cmd -I INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || return 1
+            done
+            ;;
+        *)
+            return 1
             ;;
     esac
-
-    if [ "$has_permission" = true ]; then
-        case $firewall_tool in
-            "firewalld")
-                if [ "$ip_version" == "ipv4" ]; then
-                    firewall-cmd --zone=public --add-port=${port}/tcp --permanent >/dev/null 2>&1
-                    firewall-cmd --zone=public --add-port=${port}/udp --permanent >/dev/null 2>&1
-                else
-                    firewall-cmd --zone=public --add-port=${port}/tcp --permanent --ipv6 >/dev/null 2>&1
-                    firewall-cmd --zone=public --add-port=${port}/udp --permanent --ipv6 >/dev/null 2>&1
-                fi
-                firewall-cmd --reload >/dev/null 2>&1
-                ;;
-            "ufw")
-                ufw allow ${port}/tcp >/dev/null 2>&1
-                ufw allow ${port}/udp >/dev/null 2>&1
-                ;;
-            "iptables")
-                if [ "$ip_version" == "ipv4" ]; then
-                    iptables -I INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
-                    iptables -I INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
-                else
-                    ip6tables -I INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
-                    ip6tables -I INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
-                fi
-                ;;
-        esac
-        echo -e "${Green}已成功为 ${ip_version} 端口 ${port} 配置防火墙规则 (TCP/UDP)。${Font}"
-    else
-        echo -e "${Yellow}检测到 ${firewall_tool}，但无权限修改。请手动配置 ${ip_version} 端口 ${port} 的防火墙规则 (TCP/UDP)。${Font}"
-    fi
+    
+    return 0
 }
 
 # 移除防火墙规则
@@ -509,91 +1242,162 @@ remove_firewall_rules() {
     local port=$1
     local ip_type=$2
     
-    # 处理不同类型的IP版本
-    if [ "$ip_type" == "domain" ]; then
-        ip_type="ipv4"
-    elif [ "$ip_type" == "domain6" ]; then
-        ip_type="ipv6"
-    fi
-
-    local firewall_tool=""
-    if command -v firewall-cmd >/dev/null 2>&1; then
-        firewall_tool="firewalld"
-    elif command -v ufw >/dev/null 2>&1; then
-        firewall_tool="ufw"
-    elif command -v iptables >/dev/null 2>&1; then
-        firewall_tool="iptables"
-    fi
-
-    if [ -z "$firewall_tool" ]; then
+    # 标准化IP版本参数
+    case "$ip_type" in
+        domain|ipv4) ip_type="ipv4" ;;
+        domain6|ipv6) ip_type="ipv6" ;;
+    esac
+    
+    # 检测防火墙类型
+    local firewall_type=$(detect_firewall)
+    [[ -z "$firewall_type" ]] && {
         echo -e "${Yellow}未检测到防火墙工具，跳过防火墙规则移除。${Font}"
-        return
+        return 0
+    }
+    
+    # 统一移除防火墙规则
+    if remove_firewall_rules_by_type "$firewall_type" "$port" "$ip_type"; then
+        echo -e "${Green}已移除端口 ${port} 的防火墙规则 (TCP/UDP)${Font}"
+    else
+        echo -e "${Yellow}防火墙规则移除失败或无权限${Font}"
     fi
+}
 
-    case $firewall_tool in
-        "firewalld")
-            if [ "$ip_type" == "ipv4" ]; then
-                firewall-cmd --zone=public --remove-port=${port}/tcp --permanent >/dev/null 2>&1
-                firewall-cmd --zone=public --remove-port=${port}/udp --permanent >/dev/null 2>&1
-            else
-                firewall-cmd --zone=public --remove-port=${port}/tcp --permanent --ipv6 >/dev/null 2>&1
-                firewall-cmd --zone=public --remove-port=${port}/udp --permanent --ipv6 >/dev/null 2>&1
-            fi
-            firewall-cmd --reload >/dev/null 2>&1
+# 统一的防火墙规则移除
+remove_firewall_rules_by_type() {
+    local firewall_type=$1
+    local port=$2
+    local ip_type=$3
+    
+    case "$firewall_type" in
+        firewalld)
+            local zone=$(firewall-cmd --get-default-zone 2>/dev/null || echo "public")
+            local ipv6_flag=""
+            [[ "$ip_type" == "ipv6" ]] && ipv6_flag="--ipv6"
+            
+            for protocol in tcp udp; do
+                firewall-cmd --zone="$zone" --remove-port="${port}/${protocol}" --permanent $ipv6_flag 2>/dev/null || return 1
+            done
+            firewall-cmd --reload 2>/dev/null || return 1
             ;;
-        "ufw")
-            ufw delete allow ${port}/tcp >/dev/null 2>&1
-            ufw delete allow ${port}/udp >/dev/null 2>&1
+        ufw)
+            for protocol in tcp udp; do
+                ufw delete allow "${port}/${protocol}" 2>/dev/null || return 1
+            done
             ;;
-        "iptables")
-            if [ "$ip_type" == "ipv4" ]; then
-                iptables -D INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
-                iptables -D INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
-            else
-                ip6tables -D INPUT -p tcp --dport ${port} -j ACCEPT >/dev/null 2>&1
-                ip6tables -D INPUT -p udp --dport ${port} -j ACCEPT >/dev/null 2>&1
-            fi
+        iptables)
+            local cmd="iptables"
+            [[ "$ip_type" == "ipv6" ]] && cmd="ip6tables"
+            
+            for protocol in tcp udp; do
+                $cmd -D INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || continue
+            done
+            ;;
+        *)
+            return 1
             ;;
     esac
-    echo -e "${Green}已移除端口 ${port} 的防火墙规则 (TCP/UDP)。${Font}"
+    
+    return 0
 }
 
 # 恢复之前的转发
 restore_forwards() {
     if [ -s "$CONFIG_FILE" ]; then
         echo "正在恢复之前的转发..."
-        while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
-            local service_name="socat-${listen_port}-${remote_port}"
-            if [ "$ip_type" == "ipv4" ]; then
-                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP4:${remote_ip}:${remote_port}"
-                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP4:${remote_ip}:${remote_port}"
-            elif [ "$ip_type" == "ipv6" ]; then
-                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${remote_ip}:${remote_port}"
-                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${remote_ip}:${remote_port}"
-            elif [ "$ip_type" == "domain" ]; then
-                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP:${remote_ip}:${remote_port}"
-                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP:${remote_ip}:${remote_port}"
-                # 恢复域名监控
-                setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
-            elif [ "$ip_type" == "domain6" ]; then
-                create_systemd_service "${service_name}-tcp" "/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${remote_ip}:${remote_port}"
-                create_systemd_service "${service_name}-udp" "/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${remote_ip}:${remote_port}"
-                # 恢复域名监控
-                setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
-            fi
+        
+        if command -v jq >/dev/null 2>&1; then
+            # 使用jq解析JSON配置
+            local configs=$(jq -c '.[]' "$CONFIG_FILE")
+            while IFS= read -r config; do
+                local ip_type=$(echo "$config" | jq -r '.type')
+                local listen_port=$(echo "$config" | jq -r '.listen_port')
+                local remote_ip=$(echo "$config" | jq -r '.remote_ip')
+                local remote_port=$(echo "$config" | jq -r '.remote_port')
+                
+                # 将配置类型转换为内部格式
+                local ip_version=""
+                case "$ip_type" in
+                    "ipv4") ip_version="4" ;;
+                    "ipv6") ip_version="6" ;;
+                    "domain") ip_version="domain" ;;
+                    "domain6") ip_version="domain6" ;;
+                    *) continue ;;  # 跳过无效类型
+                esac
+                
+                # 使用统一的函数创建服务
+                create_single_socat_service "tcp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
+                create_single_socat_service "udp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
+                
+                # 如果是域名类型，恢复监控
+                if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+                    setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+                fi
+                
+                # 统一的显示信息
+                case "$ip_type" in
+                    "ipv6"|"domain6")
+                        echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        ;;
+                    *)
+                        echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        ;;
+                esac
+                
+                # 域名监控恢复信息
+                if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+                    echo "已恢复域名 ${remote_ip} 的IP监控服务"
+                fi
+            done <<< "$configs"
+        else
+            # 回退到基于行的JSON解析
+            local json_content=$(cat "$CONFIG_FILE")
+            local count=$(echo "$json_content" | grep -o '"type"' | wc -l)
             
-            # 显示不同类型的转发恢复信息
-            if [ "$ip_type" == "ipv6" ] || [ "$ip_type" == "domain6" ]; then
-                echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port}"
-            else
-                echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port}"
-            fi
-            
-            # 如果是域名类型，显示监控恢复信息
-            if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-                echo "已恢复域名 ${remote_ip} 的IP监控服务"
-            fi
-        done < "$CONFIG_FILE"
+            for i in $(seq 0 $(($count-1))); do
+                local config=$(echo "$json_content" | sed -n 's/.*{\([^}]*\)}.*/\1/p' | sed -n "$((i+1))p")
+                local ip_type=$(echo "$config" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+                local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
+                local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
+                local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
+                
+                [ -z "$ip_type" ] && continue
+                
+                # 将配置类型转换为内部格式
+                local ip_version=""
+                case "$ip_type" in
+                    "ipv4") ip_version="4" ;;
+                    "ipv6") ip_version="6" ;;
+                    "domain") ip_version="domain" ;;
+                    "domain6") ip_version="domain6" ;;
+                    *) continue ;;
+                esac
+                
+                # 使用统一的函数创建服务
+                create_single_socat_service "tcp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
+                create_single_socat_service "udp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
+                
+                # 如果是域名类型，恢复监控
+                if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+                    setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+                fi
+                
+                # 统一的显示信息
+                case "$ip_type" in
+                    "ipv6"|"domain6")
+                        echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        ;;
+                    *)
+                        echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        ;;
+                esac
+                
+                # 域名监控恢复信息
+                if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+                    echo "已恢复域名 ${remote_ip} 的IP监控服务"
+                fi
+            done
+        fi
     fi
 }
 
@@ -935,9 +1739,49 @@ remove_domain_monitor() {
     rm -f /etc/systemd/system/${timer_name}.service
     rm -f /etc/systemd/system/${timer_name}.timer
     rm -f "$SOCATS_DIR/monitor_${listen_port}.sh"
+    
+    # 获取当前端口的域名信息并删除对应的DNS缓存文件
+    local domain=""
+    if command -v jq >/dev/null 2>&1; then
+        domain=$(jq -r --argjson port "$listen_port" '.[] | select(.listen_port == $port and (.type == "domain" or .type == "domain6")) | .remote_ip' "$CONFIG_FILE" 2>/dev/null)
+    else
+        # 从配置文件中提取域名
+        domain=$(grep -o '"listen_port":'$listen_port'[^}]*' "$CONFIG_FILE" | grep -o '"remote_ip":"[^"]*"' | head -n1 | cut -d'"' -f4)
+    fi
+    
+    if [[ -n "$domain" ]]; then
+        # 将域名转换为缓存文件名格式
+        local cache_filename="dns_cache_${domain//[^a-zA-Z0-9]/_}.txt"
+        local cache_file="${SOCATS_DIR}/${cache_filename}"
+        
+        if [ -f "$cache_file" ]; then
+            rm -f "$cache_file"
+            echo -e "${Green}已删除DNS缓存文件: ${cache_filename}${Font}"
+        fi
+    fi
+    
     systemctl daemon-reload
     
     echo -e "${Green}已移除端口 ${listen_port} 的域名监控服务${Font}"
+}
+
+# 切换JSON格式化开关
+toggle_json_format() {
+    if [ "$JSON_FORMAT_ENABLED" -eq 1 ]; then
+        JSON_FORMAT_ENABLED=0
+        echo -e "${Green}已关闭JSON格式化，配置文件将保持紧凑格式${Font}"
+    else
+        JSON_FORMAT_ENABLED=1
+        echo -e "${Green}已开启JSON格式化，配置文件将被格式化${Font}"
+    fi
+    
+    # 立即应用新的格式化设置到现有配置
+    if [ -f "$CONFIG_FILE" ]; then
+        format_json_config "$CONFIG_FILE" "$JSON_FORMAT_ENABLED"
+    fi
+    
+    # 保存设置到配置文件
+    echo "JSON_FORMAT_ENABLED=$JSON_FORMAT_ENABLED" > "$SOCATS_DIR/.json_format"
 }
 
 # 修改域名监控频率
@@ -948,35 +1792,58 @@ change_monitor_interval() {
     fi
     
     local has_domain=false
-    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
-        if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-            has_domain=true
-            break
-        fi
-    done < "$CONFIG_FILE"
+    local domain_entries=()
+    local i=1
+    
+    if command -v jq >/dev/null 2>&1; then
+        # 使用jq解析JSON配置
+        local configs=$(jq -c '.[]' "$CONFIG_FILE")
+        while IFS= read -r config; do
+            local ip_type=$(echo "$config" | jq -r '.type')
+            local listen_port=$(echo "$config" | jq -r '.listen_port')
+            local remote_ip=$(echo "$config" | jq -r '.remote_ip')
+            local remote_port=$(echo "$config" | jq -r '.remote_port')
+            
+            if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+                has_domain=true
+                domain_entries+=("$listen_port $remote_ip $ip_type $remote_port")
+                if [ "$ip_type" == "domain" ]; then
+                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port"
+                else
+                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port"
+                fi
+                ((i++))
+            fi
+        done <<< "$configs"
+    else
+        # 回退到基于行的JSON解析
+        local json_content=$(cat "$CONFIG_FILE")
+        local count=$(echo "$json_content" | grep -o '"type"' | wc -l)
+        
+        for j in $(seq 0 $(($count-1))); do
+            local config=$(echo "$json_content" | sed -n 's/.*{\([^}]*\)}.*/\1/p' | sed -n "$((j+1))p")
+            local ip_type=$(echo "$config" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
+            local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
+            local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
+            local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
+            
+            [ -z "$ip_type" ] && continue
+            
+            if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
+                has_domain=true
+                domain_entries+=("$listen_port $remote_ip $ip_type $remote_port")
+                if [ "$ip_type" == "domain" ]; then
+                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port"
+                else
+                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port"
+                fi
+                ((i++))
+            fi
+        done
+    fi
     
     if [ "$has_domain" == "false" ]; then
         echo -e "${Red}当前没有活动的域名转发。${Font}"
-        return
-    fi
-    
-    echo -e "${Green}当前域名转发:${Font}"
-    local i=1
-    local domain_entries=()
-    while IFS=' ' read -r ip_type listen_port remote_ip remote_port; do
-        if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-            domain_entries+=("$listen_port $remote_ip $ip_type")
-            if [ "$ip_type" == "domain" ]; then
-                echo "$i. IPv4域名: $ip:$listen_port --> $remote_ip:$remote_port"
-            else
-                echo "$i. IPv6域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port"
-            fi
-            ((i++))
-        fi
-    done < "$CONFIG_FILE"
-    
-    if [ ${#domain_entries[@]} -eq 0 ]; then
-        echo -e "${Red}未找到任何域名转发。${Font}"
         return
     fi
     
@@ -987,7 +1854,7 @@ change_monitor_interval() {
     fi
     
     local index=$((num-1))
-    IFS=' ' read -r port domain type <<< "${domain_entries[$index]}"
+    IFS=' ' read -r port domain type remote_port <<< "${domain_entries[$index]}"
     
     local timer_name="domain-monitor-${port}"
     local timer_file="/etc/systemd/system/${timer_name}.timer"
@@ -1139,9 +2006,9 @@ re_socat(){
     restore_forwards
 }
 
-# 卸载socat
+# 改进的卸载socat
 uninstall_socat() {
-    if ! command -v socat > /dev/null; then
+    if ! command -v socat >/dev/null 2>&1; then
         echo -e "${Red}错误：系统中未安装Socat，无需执行卸载操作${Font}"
         return 1
     fi
@@ -1159,42 +2026,50 @@ uninstall_socat() {
     rm -rf "$SOCATS_DIR"
     [ -f "$CONFIG_FILE" ] && rm -f "$CONFIG_FILE"
     
-    # 卸载socat程序
+    # 使用检测到的包管理器卸载
     local uninstall_success=0
-    if command -v apt-get > /dev/null; then
-        echo -e "${Yellow}正在通过apt-get卸载Socat...${Font}"
-        if apt-get remove -y socat; then
-            uninstall_success=1
-            echo -e "${Green}apt-get卸载成功${Font}"
-        else
-            echo -e "${Red}apt-get卸载失败，请手动检查${Font}"
-        fi
-    elif command -v yum > /dev/null; then
-        echo -e "${Yellow}正在通过yum卸载Socat...${Font}"
-        if yum remove -y socat; then
-            uninstall_success=1
-            echo -e "${Green}yum卸载成功${Font}"
-        else
-            echo -e "${Red}yum卸载失败，请手动检查${Font}"
-        fi
-    else
-        echo -e "${Yellow}检测到手动安装的Socat，尝试查找二进制文件...${Font}"
-        if which socat > /dev/null; then
-            local socat_path=$(which socat)
-            echo -e "${Yellow}发现Socat可执行文件: $socat_path ${Font}"
-            rm -f "$socat_path"
-            [ ! -f "$socat_path" ] && uninstall_success=1
-        fi
-    fi
+    case "$PKG_MANAGER" in
+        "apt")
+            echo -e "${Yellow}正在通过apt卸载Socat...${Font}"
+            apt-get remove -y socat && apt-get autoremove -y && uninstall_success=1
+            ;;
+        "yum")
+            echo -e "${Yellow}正在通过yum卸载Socat...${Font}"
+            yum remove -y socat && yum autoremove -y && uninstall_success=1
+            ;;
+        "dnf")
+            echo -e "${Yellow}正在通过dnf卸载Socat...${Font}"
+            dnf remove -y socat && dnf autoremove -y && uninstall_success=1
+            ;;
+        "pacman")
+            echo -e "${Yellow}正在通过pacman卸载Socat...${Font}"
+            pacman -Rns --noconfirm socat && uninstall_success=1
+            ;;
+        *)
+            # 手动删除
+            local socat_path=$(command -v socat 2>/dev/null)
+            if [[ -n "$socat_path" ]]; then
+                rm -f "$socat_path"
+                [[ ! -f "$socat_path" ]] && uninstall_success=1
+            fi
+            ;;
+    esac
     
-    if [ $uninstall_success -eq 1 ] && ! command -v socat > /dev/null; then
+    if [[ $uninstall_success -eq 1 ]] && ! command -v socat >/dev/null 2>&1; then
         echo -e "${Green}✅ Socat卸载验证通过${Font}"
     else
-        echo -e "${Red}⚠️  Socat卸载未完成，请手动检查以下内容：${Font}"
-        echo -e "${Yellow}1. 检查残留文件: which socat\n2. 检查进程状态: pgrep -f socat${Font}"
+        echo -e "${Red}⚠️  Socat卸载未完成，请手动检查：${Font}"
+        echo -e "${Yellow}1. which socat\n2. 残留进程: pgrep -f socat${Font}"
     fi
     
     echo -e "${Green}已成功卸载Socat及所有相关文件${Font}"
+    
+    # 询问是否同时卸载jq
+    read -p "是否同时卸载jq？[y/N]: " uninstall_jq_confirm
+    if [[ $uninstall_jq_confirm =~ ^[Yy]$ ]]; then
+        echo -e "${Yellow}正在卸载jq...${Font}"
+        uninstall_jq
+    fi
 }
 
 # 显示菜单
@@ -1212,7 +2087,8 @@ show_menu() {
     echo -e "${Yellow}4.${Font} 开启端口转发加速"
     echo -e "${Yellow}5.${Font} 关闭端口转发加速"
     echo -e "${Yellow}6.${Font} 设置域名监控频率"
-    echo -e "${Yellow}7.${Font} 退出脚本"
+    echo -e "${Yellow}7.${Font} 配置文件JSON格式化 ($([ "$JSON_FORMAT_ENABLED" -eq 1 ] && echo "开启" || echo "关闭"))"
+    echo -e "${Yellow}8.${Font} 退出脚本"
     echo -e "${Blue}==========================================${Font}"
     echo -e "${Green}当前 IPv4: ${ip:-未知}${Font}"
     echo -e "${Green}当前 IPv6: ${ipv6:-未知}${Font}"
@@ -1224,10 +2100,16 @@ main() {
     check_root
     check_sys
     install_socat
+    install_jq
 
     ip=$(get_ip)
     ipv6=$(get_ipv6)
 
+    // 加载JSON格式化设置
+    if [ -f "$SOCATS_DIR/.json_format" ]; then
+        source "$SOCATS_DIR/.json_format"
+    fi
+    
     // 初始化标记检查
     if [ ! -f "$SOCATS_DIR/.initialized" ]; then
     init_config
@@ -1244,16 +2126,23 @@ main() {
     
     while true; do
         show_menu
-        read -p "请输入选项 [1-7]: " choice
+        read -p "请输入选项 [1-8]: " choice
         clear_screen
         case $choice in
             1)
                 if config_socat; then
                     start_socat
+                    echo -e "${Green}Socat配置完成并成功启动！${Font}"
+                    press_any_key
+                elif [ $? -eq 1 ]; then
+                    # 用户主动取消，不显示错误
+                    echo -e "${Yellow}已取消配置操作${Font}"
+                    clear_screen
                 else
                     echo -e "${Red}配置失败，未能启动 Socat${Font}"
+                    press_any_key
                 fi
-                press_any_key
+                
                 ;;
             2)
                 view_delete_forward
@@ -1276,6 +2165,10 @@ main() {
                 press_any_key
                 ;;
             7)
+                toggle_json_format
+                press_any_key
+                ;;
+            8)
                 echo -e "${Green}感谢使用,再见!${Font}"
                 exit 0
                 ;;
