@@ -5,7 +5,7 @@ export PATH
 # ====================================================
 #    系统要求: CentOS 7+、Debian 8+、Ubuntu 16+
 #    描述: Socat 一键安装管理脚本
-#    版本: 5.5
+#    版本: 5.2
 # ====================================================
 
 Green="\033[32m"
@@ -1405,204 +1405,308 @@ restore_forwards() {
 check_and_enable_bbr() {
     echo -e "${Green}正在检查 BBR 状态...${Font}"
 
-    kernel_version=$(uname -r | cut -d- -f1)
-    if [[ $(echo $kernel_version 4.9 | awk '{print ($1 < $2)}') -eq 1 ]]; then
+    # 获取内核版本 - 更精确的版本检测
+    kernel_version=$(uname -r | sed 's/[^0-9.]*\([0-9.]*\).*/\1/')
+    major_version=$(echo "$kernel_version" | cut -d. -f1)
+    minor_version=$(echo "$kernel_version" | cut -d. -f2)
+    
+    # 检查内核版本是否支持BBR (4.9+ 支持BBR, 4.13+ 支持BBRv2)
+    if [[ $major_version -lt 4 ]] || [[ $major_version -eq 4 && $minor_version -lt 9 ]]; then
         echo -e "${Red}当前内核版本 ($kernel_version) 过低，不支持 BBR。需要 4.9 或更高版本。${Font}"
         return 1
     fi
 
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
+    # 检查系统是否支持BBR算法
+    if ! sysctl net.ipv4.tcp_available_congestion_control &>/dev/null; then
+        echo -e "${Red}系统不支持拥塞控制算法配置${Font}"
+        return 1
+    fi
 
-    if ! lsmod | grep -q "tcp_bbr"; then
-        echo -e "${Yellow}BBR 模块未加载，正在尝试加载...${Font}"
-        modprobe tcp_bbr
-        if ! lsmod | grep -q "tcp_bbr"; then
-            echo -e "${Red}无法加载 BBR 模块。请检查您的系统是否支持 BBR。${Font}"
+    # 获取可用的拥塞控制算法
+    available_cc=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "")
+    if [[ -z "$available_cc" ]]; then
+        echo -e "${Red}无法获取可用的拥塞控制算法${Font}"
+        return 1
+    fi
+
+    # 检查BBR是否可用 - 按优先级顺序：bbrplus -> bbr -> bbr2
+    bbr_variants=("bbrplus" "bbr" "bbr2")
+    supported_bbr=""
+    for variant in "${bbr_variants[@]}"; do
+        if echo "$available_cc" | grep -q "$variant"; then
+            supported_bbr="$variant"
+            break
+        fi
+    done
+
+    if [[ -z "$supported_bbr" ]]; then
+        echo -e "${Red}系统不支持BBR算法。可用算法: $available_cc${Font}"
+        return 1
+    fi
+
+    # 获取当前拥塞控制算法
+    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    if [[ -z "$current_cc" ]]; then
+        echo -e "${Red}无法获取当前拥塞控制算法${Font}"
+        return 1
+    fi
+
+    # 检查当前算法是否为BBR变体
+    is_bbr_enabled=false
+    current_bbr_variant=""
+    for variant in "${bbr_variants[@]}"; do
+        if [[ "$current_cc" == "$variant" ]]; then
+            is_bbr_enabled=true
+            current_bbr_variant="$variant"
+            echo -e "${Yellow}检测到系统已启用 ${current_bbr_variant}${Font}"
+            break
+        fi
+    done
+
+    # 检查内核是否内置BBR - 不再强制要求模块加载
+    has_bbr_module=false
+    if lsmod | grep -q "tcp_bbr" || echo "$available_cc" | grep -q "bbr"; then
+        has_bbr_module=true
+    fi
+
+    if [[ "$has_bbr_module" == false ]]; then
+        echo -e "${Yellow}BBR模块未找到，尝试加载...${Font}"
+        if modprobe tcp_bbr 2>/dev/null; then
+            echo -e "${Green}BBR模块加载成功${Font}"
+            has_bbr_module=true
+        else
+            echo -e "${Yellow}BBR模块加载失败，可能是内置内核或已集成${Font}"
+            # 继续执行，因为可能是内置内核
+        fi
+    fi
+
+    # 如果未启用BBR，尝试启用
+    if [[ "$is_bbr_enabled" != true ]]; then
+        echo -e "${Yellow}当前拥塞控制算法为 ${current_cc}，正在切换到 ${supported_bbr}...${Font}"
+        if sysctl -w net.ipv4.tcp_congestion_control="$supported_bbr" 2>/dev/null; then
+            echo -e "${Green}已切换到 ${supported_bbr}${Font}"
+            current_cc="$supported_bbr"
+        else
+            echo -e "${Red}切换到 ${supported_bbr} 失败${Font}"
             return 1
         fi
     fi
 
-    bbr_variants=("bbr" "bbr2" "bbrplus" "tsunamy")
-
-    if [[ " ${bbr_variants[@]} " =~ " ${current_cc} " ]]; then
-        echo -e "${Yellow}检测到系统已启用 ${current_cc}。${Font}"
-    else
-        echo -e "${Yellow}当前拥塞控制算法为 ${current_cc}，正在切换到 BBR...${Font}"
-        sysctl -w net.ipv4.tcp_congestion_control=bbr
-    fi
-
-    current_qdisc=$(sysctl -n net.core.default_qdisc)
-    if [[ $current_qdisc != "fq" ]]; then
+    # 检查并设置队列调度算法
+    current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    if [[ "$current_qdisc" != "fq" ]]; then
         echo -e "${Yellow}当前队列调度算法为 ${current_qdisc}，正在切换到 fq...${Font}"
-        sysctl -w net.core.default_qdisc=fq
-        echo "net.core.default_qdisc = fq" >> /etc/sysctl.conf
+        if sysctl -w net.core.default_qdisc=fq 2>/dev/null; then
+            echo -e "${Green}已切换到 fq 队列调度${Font}"
+        else
+            echo -e "${Yellow}切换到 fq 失败，可能系统不支持${Font}"
+        fi
     fi
 
-    if ! grep -q "net.ipv4.tcp_congestion_control = bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control = bbr" >> /etc/sysctl.conf
-    fi
-
-    sysctl -p
-
-    current_cc=$(sysctl -n net.ipv4.tcp_congestion_control)
-    if [[ $current_cc == "bbr" ]]; then
-        echo -e "${Green}BBR 已成功启用。${Font}"
+    # 持久化配置
+    local sysctl_file="/etc/sysctl.conf"
+    if [[ -w "$sysctl_file" ]]; then
+        # 清理旧的BBR配置
+        sed -i '/net\.ipv4\.tcp_congestion_control/d' "$sysctl_file"
+        sed -i '/net\.core\.default_qdisc/d' "$sysctl_file"
+        
+        # 添加新的BBR配置
+        echo "net.ipv4.tcp_congestion_control = $current_cc" >> "$sysctl_file"
+        echo "net.core.default_qdisc = fq" >> "$sysctl_file"
+        
+        # 重新加载配置
+        sysctl -p 2>/dev/null || echo -e "${Yellow}sysctl配置重载部分失败${Font}"
     else
-        echo -e "${Red}BBR 启用失败，当前拥塞控制算法为 ${current_cc}。${Font}"
+        echo -e "${Yellow}无法写入sysctl配置文件，配置将在重启后失效${Font}"
+    fi
+
+    # 最终验证
+    final_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    final_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "")
+    
+    # 检查是否为BBR变体
+    is_bbr_final=false
+    for variant in "${bbr_variants[@]}"; do
+        if [[ "$final_cc" == "$variant" ]]; then
+            is_bbr_final=true
+            break
+        fi
+    done
+
+    if [[ "$is_bbr_final" == true ]]; then
+        echo -e "${Green}BBR 已成功启用。当前算法: $final_cc, 队列调度: $final_qdisc${Font}"
+        return 0
+    else
+        echo -e "${Red}BBR 启用失败，当前拥塞控制算法为 ${final_cc}${Font}"
+        return 1
+    fi
+}
+
+# 网络加速配置管理
+manage_network_acceleration() {
+    local action="$1"  # "enable" 或 "disable"
+    
+    # 定义加速配置（键=值 格式）- 专为端口转发优化
+    local -A acceleration_configs=(
+        # 核心转发优化
+        ["net.ipv4.tcp_fastopen"]="3"
+        ["net.ipv4.tcp_slow_start_after_idle"]="0"
+        ["net.ipv4.tcp_mtu_probing"]="1"
+        
+        # 缓冲区优化 - 大幅提升转发性能
+        ["net.core.rmem_max"]="67108864"
+        ["net.core.wmem_max"]="67108864"
+        ["net.ipv4.tcp_rmem"]="4096 262144 67108864"
+        ["net.ipv4.tcp_wmem"]="4096 262144 67108864"
+        ["net.ipv4.tcp_mem"]="8388608 12582912 16777216"
+        ["net.core.netdev_max_backlog"]="8192"
+        ["net.core.netdev_budget"]="600"
+        
+        # 连接管理优化
+        ["net.ipv4.tcp_max_syn_backlog"]="8192"
+        ["net.ipv4.tcp_tw_reuse"]="1"
+        ["net.ipv4.tcp_fin_timeout"]="10"
+        ["net.ipv4.tcp_keepalive_time"]="600"
+        ["net.ipv4.tcp_keepalive_intvl"]="30"
+        ["net.ipv4.tcp_keepalive_probes"]="3"
+        ["net.ipv4.tcp_max_tw_buckets"]="5000000"
+        
+        # 高级TCP特性
+        ["net.ipv4.tcp_syncookies"]="1"
+        ["net.ipv4.tcp_sack"]="1"
+        ["net.ipv4.tcp_fack"]="1"
+        ["net.ipv4.tcp_window_scaling"]="1"
+        ["net.ipv4.tcp_adv_win_scale"]="1"
+        ["net.ipv4.tcp_moderate_rcvbuf"]="1"
+        ["net.ipv4.tcp_no_metrics_save"]="1"
+        ["net.ipv4.tcp_rfc1337"]="1"
+        ["net.ipv4.tcp_timestamps"]="1"
+        ["net.ipv4.tcp_ecn"]="0"  # 禁用ECN避免兼容性问题
+        
+        # 性能调优
+        ["net.core.optmem_max"]="65536"
+        ["net.ipv4.tcp_notsent_lowat"]="32768"
+        ["net.ipv4.ip_local_port_range"]="1024 65535"
+        ["net.ipv4.tcp_max_orphans"]="8192"
+        ["net.ipv4.tcp_abort_on_overflow"]="0"
+        ["net.core.somaxconn"]="8192"
+    )
+    
+    # 定义默认配置（键=值 格式）
+    local -A default_configs=(
+        ["net.ipv4.tcp_fastopen"]="0"
+        ["net.ipv4.tcp_congestion_control"]="cubic"
+        ["net.core.default_qdisc"]="pfifo_fast"
+        ["net.ipv4.tcp_slow_start_after_idle"]="1"
+        ["net.ipv4.tcp_mtu_probing"]="0"
+        ["net.core.rmem_max"]="212992"
+        ["net.core.wmem_max"]="212992"
+        ["net.ipv4.tcp_rmem"]="4096 87380 6291456"
+        ["net.ipv4.tcp_wmem"]="4096 16384 4194304"
+        ["net.ipv4.tcp_mem"]="378651 504868 757299"
+        ["net.core.netdev_max_backlog"]="1000"
+        ["net.ipv4.tcp_max_syn_backlog"]="128"
+        ["net.ipv4.tcp_tw_reuse"]="0"
+        ["net.ipv4.tcp_fin_timeout"]="60"
+        ["net.ipv4.tcp_keepalive_time"]="7200"
+        ["net.ipv4.tcp_max_tw_buckets"]="180000"
+        ["net.ipv4.tcp_syncookies"]="1"
+        ["net.ipv4.tcp_rfc1337"]="0"
+        ["net.ipv4.tcp_sack"]="1"
+        ["net.ipv4.tcp_fack"]="1"
+        ["net.ipv4.tcp_window_scaling"]="1"
+        ["net.ipv4.tcp_adv_win_scale"]="1"
+        ["net.ipv4.tcp_moderate_rcvbuf"]="1"
+        ["net.core.optmem_max"]="20480"
+        ["net.ipv4.tcp_notsent_lowat"]="4294967295"
+    )
+    
+    # 定义所有需要清理的配置键 - 包含新增和原有的所有网络参数
+    local cleanup_keys=(
+        "net.ipv4.tcp_fastopen"
+        "net.ipv4.tcp_congestion_control"
+        "net.core.default_qdisc"
+        "net.ipv4.tcp_slow_start_after_idle"
+        "net.ipv4.tcp_mtu_probing"
+        "net.core.rmem_max"
+        "net.core.wmem_max"
+        "net.ipv4.tcp_rmem"
+        "net.ipv4.tcp_wmem"
+        "net.ipv4.tcp_mem"
+        "net.core.netdev_max_backlog"
+        "net.core.netdev_budget"
+        "net.ipv4.tcp_max_syn_backlog"
+        "net.ipv4.tcp_tw_reuse"
+        "net.ipv4.tcp_fin_timeout"
+        "net.ipv4.tcp_keepalive_time"
+        "net.ipv4.tcp_keepalive_intvl"
+        "net.ipv4.tcp_keepalive_probes"
+        "net.ipv4.tcp_max_tw_buckets"
+        "net.ipv4.tcp_syncookies"
+        "net.ipv4.tcp_rfc1337"
+        "net.ipv4.tcp_sack"
+        "net.ipv4.tcp_fack"
+        "net.ipv4.tcp_window_scaling"
+        "net.ipv4.tcp_adv_win_scale"
+        "net.ipv4.tcp_moderate_rcvbuf"
+        "net.ipv4.tcp_no_metrics_save"
+        "net.ipv4.tcp_timestamps"
+        "net.ipv4.tcp_ecn"
+        "net.core.optmem_max"
+        "net.ipv4.tcp_notsent_lowat"
+        "net.ipv4.ip_local_port_range"
+        "net.ipv4.tcp_max_orphans"
+        "net.ipv4.tcp_abort_on_overflow"
+        "net.core.somaxconn"
+    )
+    
+    # 清理配置文件中的相关配置
+    for key in "${cleanup_keys[@]}"; do
+        sed -i "/${key//\./\\.}/d" /etc/sysctl.conf
+    done
+    
+    # 根据action选择配置
+    local -n configs
+    local message=""
+    
+    if [[ "$action" == "enable" ]]; then
+        configs=acceleration_configs
+        message="端口转发加速已开启"
+        
+        # 额外处理BBR
+        check_and_enable_bbr
+        echo 3 > /proc/sys/net/ipv4/tcp_fastopen
+    else
+        configs=default_configs
+        message="端口转发加速已关闭"
+    fi
+    
+    # 应用配置（静默执行）
+    for key in "${!configs[@]}"; do
+        sysctl -w "${key}=${configs[$key]}" >/dev/null 2>&1  #删除”/dev/null 2>&1“输出信息
+        echo "${key} = ${configs[$key]}" >> /etc/sysctl.conf
+    done
+    
+    sysctl -p >/dev/null 2>&1 #删除”/dev/null 2>&1“输出信息
+    
+    # 输出结果
+    if [[ "$action" == "enable" ]]; then
+        echo -e "${Green}${message}${Font}"
+    else
+        echo -e "${Yellow}${message}${Font}"
     fi
 }
 
 # 开启端口转发加速
 enable_acceleration() {
     echo -e "${Green}正在开启端口转发加速...${Font}"
-
-    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
-    sed -i '/net.core.rmem_max/d' /etc/sysctl.conf
-    sed -i '/net.core.wmem_max/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_mem/d' /etc/sysctl.conf
-    sed -i '/net.core.netdev_max_backlog/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_max_syn_backlog/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_fin_timeout/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_max_tw_buckets/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_syncookies/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_rfc1337/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_sack/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_fack/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_window_scaling/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_adv_win_scale/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_moderate_rcvbuf/d' /etc/sysctl.conf
-    sed -i '/net.core.optmem_max/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_notsent_lowat/d' /etc/sysctl.conf
-
-    check_and_enable_bbr
-
-    echo 3 > /proc/sys/net/ipv4/tcp_fastopen
-
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=0
-    sysctl -w net.ipv4.tcp_mtu_probing=1
-
-    sysctl -w net.core.rmem_max=26214400
-    sysctl -w net.core.wmem_max=26214400
-    sysctl -w net.ipv4.tcp_rmem='4096 87380 26214400'
-    sysctl -w net.ipv4.tcp_wmem='4096 16384 26214400'
-    sysctl -w net.ipv4.tcp_mem='26214400 26214400 26214400'
-    sysctl -w net.core.netdev_max_backlog=2048
-    sysctl -w net.ipv4.tcp_max_syn_backlog=2048
-    sysctl -w net.ipv4.tcp_tw_reuse=1
-    sysctl -w net.ipv4.tcp_fin_timeout=15
-    sysctl -w net.ipv4.tcp_keepalive_time=1200
-    sysctl -w net.ipv4.tcp_max_tw_buckets=2000000
-    sysctl -w net.ipv4.tcp_fastopen=3
-    sysctl -w net.ipv4.tcp_mtu_probing=1
-    sysctl -w net.ipv4.tcp_syncookies=1
-    sysctl -w net.ipv4.tcp_rfc1337=1
-    sysctl -w net.ipv4.tcp_sack=1
-    sysctl -w net.ipv4.tcp_fack=1
-    sysctl -w net.ipv4.tcp_window_scaling=1
-    sysctl -w net.ipv4.tcp_adv_win_scale=2
-    sysctl -w net.ipv4.tcp_moderate_rcvbuf=1
-    sysctl -w net.core.optmem_max=65535
-    sysctl -w net.ipv4.tcp_notsent_lowat=16384
-
-    echo "net.ipv4.tcp_fastopen = 3" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_slow_start_after_idle = 0" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.conf
-    echo "net.core.rmem_max = 26214400" >> /etc/sysctl.conf
-    echo "net.core.wmem_max = 26214400" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_rmem = 4096 87380 26214400" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_wmem = 4096 16384 26214400" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_mem = 26214400 26214400 26214400" >> /etc/sysctl.conf
-    echo "net.core.netdev_max_backlog = 2048" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_max_syn_backlog = 2048" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_tw_reuse = 1" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_fin_timeout = 15" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_keepalive_time = 1200" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_max_tw_buckets = 2000000" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_fastopen = 3" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_mtu_probing = 1" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_syncookies = 1" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_rfc1337 = 1" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_sack = 1" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_fack = 1" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_window_scaling = 1" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_adv_win_scale = 2" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_moderate_rcvbuf = 1" >> /etc/sysctl.conf
-    echo "net.core.optmem_max = 65535" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_notsent_lowat = 16384" >> /etc/sysctl.conf
-
-    sysctl -p
-
-    echo -e "${Green}端口转发加速已开启${Font}"
+    manage_network_acceleration "enable"
 }
 
 # 关闭端口转发加速
 disable_acceleration() {
     echo -e "${Yellow}正在关闭端口转发加速...${Font}"
-
-    sysctl -w net.ipv4.tcp_fastopen=0
-    sysctl -w net.ipv4.tcp_congestion_control=cubic
-    sysctl -w net.core.default_qdisc=pfifo_fast
-    sysctl -w net.ipv4.tcp_slow_start_after_idle=1
-    sysctl -w net.ipv4.tcp_mtu_probing=0
-
-    sysctl -w net.core.rmem_max=212992
-    sysctl -w net.core.wmem_max=212992
-    sysctl -w net.ipv4.tcp_rmem='4096 87380 6291456'
-    sysctl -w net.ipv4.tcp_wmem='4096 16384 4194304'
-    sysctl -w net.ipv4.tcp_mem='378651 504868 757299'
-    sysctl -w net.core.netdev_max_backlog=1000
-    sysctl -w net.ipv4.tcp_max_syn_backlog=128
-    sysctl -w net.ipv4.tcp_tw_reuse=0
-    sysctl -w net.ipv4.tcp_fin_timeout=60
-    sysctl -w net.ipv4.tcp_keepalive_time=7200
-    sysctl -w net.ipv4.tcp_max_tw_buckets=180000
-    sysctl -w net.ipv4.tcp_syncookies=1
-    sysctl -w net.ipv4.tcp_rfc1337=0
-    sysctl -w net.ipv4.tcp_sack=1
-    sysctl -w net.ipv4.tcp_fack=1
-    sysctl -w net.ipv4.tcp_window_scaling=1
-    sysctl -w net.ipv4.tcp_adv_win_scale=1
-    sysctl -w net.ipv4.tcp_moderate_rcvbuf=1
-    sysctl -w net.core.optmem_max=20480
-    sysctl -w net.ipv4.tcp_notsent_lowat=4294967295
-
-    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
-    sed -i '/net.core.default_qdisc/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_slow_start_after_idle/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_mtu_probing/d' /etc/sysctl.conf
-    sed -i '/net.core.rmem_max/d' /etc/sysctl.conf
-    sed -i '/net.core.wmem_max/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_rmem/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_wmem/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_mem/d' /etc/sysctl.conf
-    sed -i '/net.core.netdev_max_backlog/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_max_syn_backlog/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_tw_reuse/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_fin_timeout/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_keepalive_time/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_max_tw_buckets/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_fastopen/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_syncookies/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_rfc1337/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_sack/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_fack/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_window_scaling/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_adv_win_scale/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_moderate_rcvbuf/d' /etc/sysctl.conf
-    sed -i '/net.core.optmem_max/d' /etc/sysctl.conf
-    sed -i '/net.ipv4.tcp_notsent_lowat/d' /etc/sysctl.conf
-
-    sysctl -p
-
-    echo -e "${Yellow}端口转发加速已关闭${Font}"
+    manage_network_acceleration "disable"
 }
 
 # 设置域名监控服务
