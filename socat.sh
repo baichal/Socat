@@ -499,8 +499,7 @@ add_to_config() {
         if [[ "$content" == "[]" ]]; then
             echo "[$new_entry]" > "$CONFIG_FILE"
             rm -f "$temp_file"
-        # 确保格式正确
-        fix_json_format
+            fix_json_format
             return
         fi
         
@@ -1605,10 +1604,13 @@ manage_network_acceleration() {
         ["net.ipv4.tcp_wmem"]="4096 16384 4194304"
         ["net.ipv4.tcp_mem"]="378651 504868 757299"
         ["net.core.netdev_max_backlog"]="1000"
+        ["net.core.netdev_budget"]="300"
         ["net.ipv4.tcp_max_syn_backlog"]="128"
         ["net.ipv4.tcp_tw_reuse"]="0"
         ["net.ipv4.tcp_fin_timeout"]="60"
         ["net.ipv4.tcp_keepalive_time"]="7200"
+        ["net.ipv4.tcp_keepalive_intvl"]="75"
+        ["net.ipv4.tcp_keepalive_probes"]="9"
         ["net.ipv4.tcp_max_tw_buckets"]="180000"
         ["net.ipv4.tcp_syncookies"]="1"
         ["net.ipv4.tcp_rfc1337"]="0"
@@ -1617,8 +1619,15 @@ manage_network_acceleration() {
         ["net.ipv4.tcp_window_scaling"]="1"
         ["net.ipv4.tcp_adv_win_scale"]="1"
         ["net.ipv4.tcp_moderate_rcvbuf"]="1"
+        ["net.ipv4.tcp_no_metrics_save"]="0"
+        ["net.ipv4.tcp_timestamps"]="1"
+        ["net.ipv4.tcp_ecn"]="2"
         ["net.core.optmem_max"]="20480"
         ["net.ipv4.tcp_notsent_lowat"]="4294967295"
+        ["net.ipv4.ip_local_port_range"]="32768 60999"
+        ["net.ipv4.tcp_max_orphans"]="8192"
+        ["net.ipv4.tcp_abort_on_overflow"]="0"
+        ["net.core.somaxconn"]="128"
     )
     
     # 定义所有需要清理的配置键 - 包含新增和原有的所有网络参数
@@ -1665,29 +1674,31 @@ manage_network_acceleration() {
         sed -i "/${key//\./\\.}/d" /etc/sysctl.conf
     done
     
-    # 根据action选择配置
-    local -n configs
+    # 应用加速配置或默认配置
     local message=""
     
     if [[ "$action" == "enable" ]]; then
-        configs=acceleration_configs
         message="端口转发加速已开启"
         
         # 额外处理BBR
         check_and_enable_bbr
-        echo 3 > /proc/sys/net/ipv4/tcp_fastopen
+        
+        # 应用加速配置
+        for key in "${!acceleration_configs[@]}"; do
+            sysctl -w "${key}=${acceleration_configs[$key]}" >/dev/null 2>&1
+            echo "${key} = ${acceleration_configs[$key]}" >> /etc/sysctl.conf
+        done
     else
-        configs=default_configs
         message="端口转发加速已关闭"
+        
+        # 应用默认配置
+        for key in "${!default_configs[@]}"; do
+            sysctl -w "${key}=${default_configs[$key]}" >/dev/null 2>&1
+            echo "${key} = ${default_configs[$key]}" >> /etc/sysctl.conf
+        done
     fi
     
-    # 应用配置（静默执行）
-    for key in "${!configs[@]}"; do
-        sysctl -w "${key}=${configs[$key]}" >/dev/null 2>&1  #删除”/dev/null 2>&1“输出信息
-        echo "${key} = ${configs[$key]}" >> /etc/sysctl.conf
-    done
-    
-    sysctl -p >/dev/null 2>&1 #删除”/dev/null 2>&1“输出信息
+    sysctl -p >/dev/null 2>&1
     
     # 输出结果
     if [[ "$action" == "enable" ]]; then
@@ -1707,6 +1718,84 @@ enable_acceleration() {
 disable_acceleration() {
     echo -e "${Yellow}正在关闭端口转发加速...${Font}"
     manage_network_acceleration "disable"
+}
+
+# 查看端口转发加速状态
+show_acceleration_status() {
+    echo -e "${Green}=== 端口转发加速状态 ===${Font}"
+    echo
+    
+    # 检查BBR状态
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    local is_bbr=false
+    
+    for variant in bbrplus bbr bbr2; do
+        if [[ "$current_cc" == "$variant" ]]; then
+            is_bbr=true
+            break
+        fi
+    done
+    
+    echo -e "拥塞控制算法: ${Blue}$current_cc${Font} $($is_bbr && echo -e "${Green}[已启用BBR]${Font}" || echo -e "${Yellow}[未启用BBR]${Font}")"
+    echo -e "队列调度算法: ${Blue}$current_qdisc${Font}"
+    echo
+    
+    # 检查关键加速参数
+    echo -e "${Green}关键加速参数:${Font}"
+    
+    local params=(
+        "net.ipv4.tcp_fastopen|TCP快速打开"
+        "net.ipv4.tcp_slow_start_after_idle|空闲后慢启动"
+        "net.core.rmem_max|最大接收缓冲区"
+        "net.core.wmem_max|最大发送缓冲区"
+        "net.ipv4.tcp_tw_reuse|TIME_WAIT重用"
+        "net.ipv4.tcp_fin_timeout|FIN超时时间"
+    )
+    
+    local enabled_count=0
+    local total_params=0
+    
+    for param_info in "${params[@]}"; do
+        local key="${param_info%%|*}"
+        local name="${param_info##*|}"
+        local value=$(sysctl -n "$key" 2>/dev/null || echo "未知")
+        echo -e "  $name: ${Blue}$value${Font}"
+        
+        # 简单判断是否为加速值
+        total_params=$((total_params + 1))
+        case "$key" in
+            "net.ipv4.tcp_fastopen")
+                [[ "$value" == "3" ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.ipv4.tcp_slow_start_after_idle")
+                [[ "$value" == "0" ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.core.rmem_max")
+                [[ "$value" -gt 212992 ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.core.wmem_max")
+                [[ "$value" -gt 212992 ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.ipv4.tcp_tw_reuse")
+                [[ "$value" == "1" ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.ipv4.tcp_fin_timeout")
+                [[ "$value" -lt 60 ]] && enabled_count=$((enabled_count + 1))
+                ;;
+        esac
+    done
+    
+    echo
+    
+    # 综合判断加速状态
+    if $is_bbr && [[ $enabled_count -ge $((total_params / 2)) ]]; then
+        echo -e "${Green}端口转发加速: 已启用${Font}"
+    elif $is_bbr || [[ $enabled_count -gt 0 ]]; then
+        echo -e "${Yellow}端口转发加速: 部分启用${Font} (已优化 $enabled_count/$total_params 项参数)"
+    else
+        echo -e "${Red}端口转发加速: 未启用${Font}"
+    fi
 }
 
 # 设置域名监控服务
@@ -2190,9 +2279,10 @@ show_menu() {
     echo -e "${Yellow}3.${Font} Socat管理"
     echo -e "${Yellow}4.${Font} 开启端口转发加速"
     echo -e "${Yellow}5.${Font} 关闭端口转发加速"
-    echo -e "${Yellow}6.${Font} 设置域名监控频率"
-    echo -e "${Yellow}7.${Font} 配置文件JSON格式化 ($([ "$JSON_FORMAT_ENABLED" -eq 1 ] && echo "开启" || echo "关闭"))"
-    echo -e "${Yellow}8.${Font} 退出脚本"
+    echo -e "${Yellow}6.${Font} 查看加速状态"
+    echo -e "${Yellow}7.${Font} 设置域名监控频率"
+    echo -e "${Yellow}8.${Font} 配置文件JSON格式化 ($([ "$JSON_FORMAT_ENABLED" -eq 1 ] && echo "开启" || echo "关闭"))"
+    echo -e "${Yellow}9.${Font} 退出脚本"
     echo -e "${Blue}==========================================${Font}"
     echo -e "${Green}当前 IPv4: ${ip:-未知}${Font}"
     echo -e "${Green}当前 IPv6: ${ipv6:-未知}${Font}"
@@ -2209,12 +2299,12 @@ main() {
     ip=$(get_ip)
     ipv6=$(get_ipv6)
 
-    // 加载JSON格式化设置
+    # 加载JSON格式化设置
     if [ -f "$SOCATS_DIR/.json_format" ]; then
         source "$SOCATS_DIR/.json_format"
     fi
     
-    // 初始化标记检查
+    # 初始化标记检查
     if [ ! -f "$SOCATS_DIR/.initialized" ]; then
     init_config
     restore_forwards
@@ -2230,7 +2320,7 @@ main() {
     
     while true; do
         show_menu
-        read -p "请输入选项 [1-8]: " choice
+        read -p "请输入选项 [1-9]: " choice
         clear_screen
         case $choice in
             1)
@@ -2265,14 +2355,18 @@ main() {
                 press_any_key
                 ;;
             6)
-                change_monitor_interval
+                show_acceleration_status
                 press_any_key
                 ;;
             7)
-                toggle_json_format
+                change_monitor_interval
                 press_any_key
                 ;;
             8)
+                toggle_json_format
+                press_any_key
+                ;;
+            9)
                 echo -e "${Green}感谢使用,再见!${Font}"
                 exit 0
                 ;;
