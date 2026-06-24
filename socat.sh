@@ -996,13 +996,15 @@ start_socat(){
         echo -e "${Blue}远程地址: ${socatip}${Font}"
         
         # 统一的显示信息
+        local local_addr="$ip"
+        [[ "$ip_version" == "2" ]] && [[ -n "$ipv6" ]] && local_addr="$ipv6"
         case "$ip_version" in
             1)
                 echo -e "${Blue}本地服务器IP: ${ip}${Font}"
                 echo -e "${Blue}IP版本: IPv4${Font}"
                 ;;
             2)
-                echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+                echo -e "${Blue}本地服务器IPv6: ${ipv6:-未检测到}${Font}"
                 echo -e "${Blue}IP版本: IPv6${Font}"
                 ;;
             3)
@@ -1011,7 +1013,7 @@ start_socat(){
                 echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
                 ;;
             4)
-                echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+                echo -e "${Blue}本地服务器IPv6: ${ipv6:-未检测到}${Font}"
                 echo -e "${Blue}地址类型: 域名 (DDNS, IPv6优先)${Font}"
                 echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
                 ;;
@@ -1058,18 +1060,19 @@ view_delete_forward() {
             local remote_port=$(echo "$config" | jq -r '.remote_port')
             
             entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
                     echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
                     ;;
                 "ipv6")
-                    echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
                     ;;
                 "domain")
                     echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
                     ;;
                 "domain6")
-                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
                     ;;
             esac
             ((i++))
@@ -1089,18 +1092,19 @@ view_delete_forward() {
             [ -z "$ip_type" ] && continue
             
             entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
                     echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
                     ;;
                 "ipv6")
-                    echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
                     ;;
                 "domain")
                     echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
                     ;;
                 "domain6")
-                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
                     ;;
             esac
             ((i++))
@@ -1126,18 +1130,19 @@ view_delete_forward() {
                     echo "$new_content" > "$CONFIG_FILE"
                 fi
                 
+                local local_ipv6="${ipv6:-未检测到}"
                 case "$ip_type" in
                     "ipv4")
                         echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
                         ;;
                     "ipv6")
-                        echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port (TCP/UDP)${Font}"
+                        echo -e "${Green}已删除IPv6转发: [$local_ipv6]:$listen_port (TCP/UDP)${Font}"
                         ;;
                     "domain")
                         echo -e "${Green}已删除IPv4 域名转发: $ip:$listen_port --> $remote_ip (TCP/UDP) [IPv4]${Font}"
                         ;;
                     "domain6")
-                        echo -e "${Green}已删除IPv6 域名转发: [$ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
+                        echo -e "${Green}已删除IPv6 域名转发: [$local_ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
                         ;;
                 esac
                 remove_firewall_rules "$listen_port" "$ip_type"
@@ -1937,10 +1942,11 @@ monitor_domain_ip() {
         echo "$(date): 检测到域名 $domain 的IP变更: $cached_ip -> $current_ip" >> "${SOCATS_DIR}/dns_monitor.log"
         echo "$current_ip" > "$cache_file"
         
-        # 重启对应的socat服务
-        local service_name="socat-${listen_port}-*"
-        systemctl restart $service_name
-        echo "$(date): 已重启转发服务 $service_name" >> "${SOCATS_DIR}/dns_monitor.log"
+        # 重启对应的socat服务（精确指定TCP和UDP服务）
+        local tcp_service="socat-${LISTEN_PORT}-${REMOTE_PORT}-tcp"
+        local udp_service="socat-${LISTEN_PORT}-${REMOTE_PORT}-udp"
+        systemctl restart "$tcp_service" "$udp_service" 2>/dev/null
+        echo "$(date): 已重启转发服务 $tcp_service $udp_service" >> "${SOCATS_DIR}/dns_monitor.log"
         return 0
     fi
     
@@ -1955,6 +1961,12 @@ EOF
     
     # 创建systemd定时器服务
     local timer_name="domain-monitor-${listen_port}"
+    
+    # 检查定时器是否已存在，若存在则跳过
+    if systemctl is-active --quiet "$timer_name.timer" 2>/dev/null; then
+        echo -e "${Yellow}域名 ${domain} 的监控定时器已存在，跳过创建${Font}"
+        return 0
+    fi
     
     cat > /etc/systemd/system/${timer_name}.service <<EOF
 [Unit]
