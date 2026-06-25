@@ -1510,7 +1510,8 @@ view_delete_forward() {
                 proto_display=$(echo "$protocols_raw" | tr -d '[]"' | sed 's/,/ \/ /g' | tr 'a-z' 'A-Z')
             fi
             
-            entries+=("$ip_type $listen_port $remote_ip $remote_port $protocols_raw $extra_raw")
+            # 使用 | 分隔符存储，避免 extra 中空格导致解析错误
+            entries+=("$ip_type|$listen_port|$remote_ip|$remote_port|$protocols_raw|$extra_raw")
             local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
@@ -1562,7 +1563,8 @@ view_delete_forward() {
                 proto_display=$(echo "$protocols_raw" | tr ' ' '/' | tr 'a-z' 'A-Z')
             fi
             
-            entries+=("$ip_type $listen_port $remote_ip $remote_port $protocols_raw $extra_raw")
+            # 使用 | 分隔符存储，避免 extra 中空格导致解析错误
+            entries+=("$ip_type|$listen_port|$remote_ip|$remote_port|$protocols_raw|$extra_raw")
             local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
@@ -1602,12 +1604,7 @@ view_delete_forward() {
             if [ $num -ge 1 ] && [ $num -lt $i ]; then
                 local index=$((num-1))
                 local entry_str="${entries[$index]}"
-                local ip_type=$(echo "$entry_str" | awk '{print $1}')
-                local listen_port=$(echo "$entry_str" | awk '{print $2}')
-                local remote_ip=$(echo "$entry_str" | awk '{print $3}')
-                local remote_port=$(echo "$entry_str" | awk '{print $4}')
-                local protocols_raw=$(echo "$entry_str" | awk '{print $5}')
-                local extra_raw=$(echo "$entry_str" | awk '{print $6}')
+                IFS='|' read -r ip_type listen_port remote_ip remote_port protocols_raw extra_raw <<< "$entry_str"
                 
                 # 解析协议列表用于显示
                 local proto_display="TCP/UDP"
