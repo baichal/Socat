@@ -36,7 +36,7 @@
 
 ```bash
 # 下载脚本
-curl -sL https://raw.githubusercontent.com/baichal/Socat/refs/heads/main/socat.sh
+curl -sL https://raw.githubusercontent.com/baichal/Socat/refs/heads/main/socat.sh -o socat.sh
 
 # 添加执行权限
 chmod +x socat.sh
