@@ -926,13 +926,14 @@ config_socat(){
             while true; do
                 read -p "请输入UNIX套接字路径: " unix_path
                 if [[ -n "$unix_path" && "$unix_path" == /* ]]; then
-                    extra_config="$unix_path"
                     if [ "$unix_dir" == "1" ]; then
-                        # TCP -> UNIX：socatip = socket路径，方向由 create_single_socat_service 判断
-                        socatip="$unix_path"
+                        # TCP -> UNIX
+                        extra_config="tcp2unix:${unix_path}"
+                        socatip="${unix_path}"
                     else
-                        # UNIX -> TCP：socatip 设为特殊值，用于方向判断
-                        socatip="unix_to_tcp"
+                        # UNIX -> TCP
+                        extra_config="unix2tcp:${unix_path}"
+                        socatip="127.0.0.1"
                     fi
                     break
                 else
@@ -993,7 +994,7 @@ config_socat(){
     else
         # UNIX模式的端口处理
         if [ "$unix_dir" == "1" ]; then
-            # TCP -> UNIX：需要本地端口
+            # TCP -> UNIX：需要本地监听端口
             while true; do
                 read -p "请输入本地监听端口 (留空随机分配): " port1
                 if [[ -z "$port1" ]]; then
@@ -1010,7 +1011,7 @@ config_socat(){
             done
             port2=0  # 远程端口用0占位
         else
-            # UNIX -> TCP：需要目标端口
+            # UNIX -> TCP：需要目标TCP端口
             port1=0  # 本地端口用0占位（UNIX socket路径作标识）
             while true; do
                 read -p "请输入目标TCP端口 (127.0.0.1): " port2
@@ -1056,14 +1057,8 @@ config_socat(){
             done
         fi
     else
-        # UNIX模式：设置显示用的占位地址（非真实地址，用于日志显示）
-        if [ "$unix_dir" == "1" ]; then
-            # TCP -> UNIX：socatip 已在上面设为 socket 路径
-            :
-        else
-            # UNIX -> TCP：socatip 已在上面设为 unix_to_tcp，这里再覆盖为显示用地址
-            socatip="127.0.0.1:${port2}"
-        fi
+        # UNIX模式：socatip 和 extra_config 已在上面设置完毕
+        :
     fi
 }
 
@@ -1206,9 +1201,30 @@ create_single_socat_service() {
     local service_name="socat-${listen_port}-${target_port}-${protocol}"
     local socat_cmd=""
     
-    # UNIX -> TCP 模式时，listen_port 可能为0，用 target_port 作服务名标识
-    if [ "$protocol" == "unix" ] && [ "$listen_port" == "0" ]; then
-        service_name="socat-unix-${target_port}-${protocol}"
+    # UNIX 协议：根据方向和路径生成唯一服务名
+    if [ "$protocol" == "unix" ]; then
+        # 解析extra获取路径
+        local unix_path=""
+        if [[ "$extra" == tcp2unix:* ]] || [[ "$extra" == unix2tcp:* ]]; then
+            unix_path="${extra#*:}"
+        elif [[ "$extra" == /* ]]; then
+            unix_path="$extra"
+        else
+            unix_path="$target_ip"
+        fi
+        
+        # 用路径的basename和端口组合生成服务名，避免冲突
+        local path_suffix=$(basename "$unix_path")
+        # 替换特殊字符
+        path_suffix=$(echo "$path_suffix" | tr '/.' '_')
+        
+        if [ "$listen_port" == "0" ]; then
+            # UNIX -> TCP 模式
+            service_name="socat-unix-${path_suffix}-${target_port}-unix"
+        else
+            # TCP -> UNIX 模式
+            service_name="socat-${listen_port}-unix-${path_suffix}-unix"
+        fi
     fi
     
     # TCP 通用选项
@@ -1265,22 +1281,40 @@ create_single_socat_service() {
             fi
             ;;
         unix)
-            # extra: UNIX socket 路径
-            # socatip: "unix_listen"=TCP->UNIX, "unix_connect"=UNIX->TCP (通过extra判断)
-            # 通过 extra 是否为绝对路径来判断方向
-            if [[ "$extra" == /* ]]; then
-                # extra 是绝对路径，说明是配置时传入的
-                # socatip 如果等于 extra，说明是 TCP->UNIX 模式
-                if [[ "$target_ip" == "$extra" ]] || [[ "$target_ip" == "127.0.0.1:${target_port}" ]]; then
-                    # UNIX -> TCP 模式
-                    socat_cmd="/usr/bin/socat UNIX-LISTEN:${extra},reuseaddr,fork,unlink-early TCP4:127.0.0.1:${target_port},connect-timeout=10"
+            # extra 格式：tcp2unix:/path 或 unix2tcp:/path （新格式）
+            # 兼容旧格式：/path （纯路径，需通过target_ip判断）
+            local unix_path=""
+            local unix_direction=""  # tcp2unix 或 unix2tcp
+            
+            if [[ "$extra" == tcp2unix:* ]]; then
+                unix_direction="tcp2unix"
+                unix_path="${extra#tcp2unix:}"
+            elif [[ "$extra" == unix2tcp:* ]]; then
+                unix_direction="unix2tcp"
+                unix_path="${extra#unix2tcp:}"
+            elif [[ "$extra" == /* ]]; then
+                # 旧格式兼容：纯路径
+                unix_path="$extra"
+                # 通过 target_ip 判断方向
+                if [[ "$target_ip" == "127.0.0.1:${target_port}" ]]; then
+                    unix_direction="unix2tcp"
+                elif [[ "$target_ip" == "$extra" ]]; then
+                    unix_direction="tcp2unix"
                 else
-                    # TCP -> UNIX 模式
-                    socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} UNIX-CONNECT:${extra}"
+                    unix_direction="tcp2unix"  # 默认TCP->UNIX
                 fi
             else
-                # 兼容旧配置：extra 可能不存在
-                socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} UNIX-CONNECT:${target_ip}"
+                # 兼容最老配置：extra 不存在，target_ip 是路径
+                unix_path="$target_ip"
+                unix_direction="tcp2unix"
+            fi
+            
+            if [[ "$unix_direction" == "unix2tcp" ]]; then
+                # UNIX -> TCP 模式
+                socat_cmd="/usr/bin/socat UNIX-LISTEN:${unix_path},reuseaddr,fork,unlink-early TCP4:127.0.0.1:${target_port},connect-timeout=10"
+            else
+                # TCP -> UNIX 模式
+                socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} UNIX-CONNECT:${unix_path}"
             fi
             ;;
         socks)
@@ -1300,6 +1334,9 @@ create_single_socat_service() {
     esac
     
     create_systemd_service "$service_name" "$socat_cmd"
+    
+    # 输出服务名，供调用方捕获
+    echo "$service_name"
 }
 
 # 启动Socat - 重构后的版本
@@ -1336,13 +1373,8 @@ start_socat(){
     # 根据 forward_protocols 数组创建对应协议的服务
     local service_names=()
     for proto in "${forward_protocols[@]}"; do
-        create_single_socat_service "$proto" "$ip_type_num" "$port1" "$socatip" "$port2" "$extra_config"
-        # 服务名用于后续状态检查，UNIX模式特殊处理
-        if [ "$proto" == "unix" ] && [ "$port1" == "0" ]; then
-            service_names+=("socat-unix-${port2}-${proto}")
-        else
-            service_names+=("socat-${port1}-${port2}-${proto}")
-        fi
+        local svc_name=$(create_single_socat_service "$proto" "$ip_type_num" "$port1" "$socatip" "$port2" "$extra_config")
+        service_names+=("$svc_name")
     done
     
     # 如果是域名类型，设置监控（仅TCP类协议有效，排除UNIX和代理协议）
@@ -1374,11 +1406,14 @@ start_socat(){
         
         # UNIX模式特殊显示
         if [[ " ${forward_protocols[*]} " =~ " unix " ]]; then
-            echo -e "${Blue}UNIX套接字路径: ${extra_config}${Font}"
-            if [[ "$socatip" == "$extra_config" ]]; then
+            # 提取实际的socket路径
+            local display_path="${extra_config#tcp2unix:}"
+            display_path="${display_path#unix2tcp:}"
+            echo -e "${Blue}UNIX套接字路径: ${display_path}${Font}"
+            if [[ "$extra_config" == tcp2unix:* ]]; then
                 echo -e "${Blue}方向: TCP端口 ${port1} -> UNIX套接字${Font}"
             else
-                echo -e "${Blue}方向: UNIX套接字 -> ${socatip}${Font}"
+                echo -e "${Blue}方向: UNIX套接字 -> 127.0.0.1:${port2}${Font}"
             fi
         else
             echo -e "${Blue}本地端口: ${port1}${Font}"
@@ -1418,7 +1453,7 @@ start_socat(){
         add_to_config
         # UNIX套接字模式不需要配置防火墙
         if [[ ! " ${forward_protocols[*]} " =~ " unix " ]]; then
-            configure_firewall ${port1} "$firewall_type"
+            configure_firewall ${port1} "$firewall_type" "${forward_protocols[*]}"
         fi
         return 0
     else
@@ -1488,8 +1523,16 @@ view_delete_forward() {
             esac
             # 显示extra信息（如果有）
             if [[ -n "$extra_raw" && "$extra_raw" != "null" && -n "$extra_raw" ]]; then
-                [[ "$extra_raw" == /* ]] && echo "   UNIX套接字: $extra_raw"
-                [[ "$extra_raw" == *:* ]] && echo "   代理: $extra_raw"
+                if [[ "$extra_raw" == tcp2unix:* ]] || [[ "$extra_raw" == unix2tcp:* ]]; then
+                    local display_unix="${extra_raw#*:}"
+                    local dir_label="TCP->UNIX"
+                    [[ "$extra_raw" == unix2tcp:* ]] && dir_label="UNIX->TCP"
+                    echo "   UNIX套接字: $display_unix ($dir_label)"
+                elif [[ "$extra_raw" == /* ]]; then
+                    echo "   UNIX套接字: $extra_raw"
+                elif [[ "$extra_raw" == *:* && "$extra_raw" != tcp2unix:* && "$extra_raw" != unix2tcp:* ]]; then
+                    echo "   代理: $extra_raw"
+                fi
             fi
             ((i++))
         done <<< "$configs"
@@ -1532,8 +1575,16 @@ view_delete_forward() {
             esac
             # 显示extra信息
             if [[ -n "$extra_raw" ]]; then
-                [[ "$extra_raw" == /* ]] && echo "   UNIX套接字: $extra_raw"
-                [[ "$extra_raw" == *:* ]] && echo "   代理: $extra_raw"
+                if [[ "$extra_raw" == tcp2unix:* ]] || [[ "$extra_raw" == unix2tcp:* ]]; then
+                    local display_unix="${extra_raw#*:}"
+                    local dir_label="TCP->UNIX"
+                    [[ "$extra_raw" == unix2tcp:* ]] && dir_label="UNIX->TCP"
+                    echo "   UNIX套接字: $display_unix ($dir_label)"
+                elif [[ "$extra_raw" == /* ]]; then
+                    echo "   UNIX套接字: $extra_raw"
+                elif [[ "$extra_raw" == *:* && "$extra_raw" != tcp2unix:* && "$extra_raw" != unix2tcp:* ]]; then
+                    echo "   代理: $extra_raw"
+                fi
             fi
             ((i++))
         done <<< "$configs"
@@ -1561,13 +1612,28 @@ view_delete_forward() {
                 
                 remove_forward "$listen_port" "$ip_type" "$protocols_raw" "$extra_raw"
                 
-                # 从JSON配置中删除
+                # 从JSON配置中删除（精确匹配，避免误删）
                 if command -v jq >/dev/null 2>&1; then
-                    jq --arg port "$listen_port" 'del(.[] | select(.listen_port == ($port | tonumber)))' "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                    # 有jq时，使用 listen_port + extra 组合精确匹配
+                    if [[ -n "$extra_raw" && "$extra_raw" != "null" ]]; then
+                        jq --arg port "$listen_port" --arg extra "$extra_raw" \
+                            'del(.[] | select(.listen_port == ($port | tonumber) and .extra == $extra))' \
+                            "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                    else
+                        jq --arg port "$listen_port" 'del(.[] | select(.listen_port == ($port | tonumber)))' \
+                            "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                    fi
                 else
-                    # 回退到基于sed的删除
+                    # 回退到基于行的删除 - 使用更精确的匹配
                     local json_content=$(cat "$CONFIG_FILE")
-                    local new_content=$(echo "$json_content" | sed 's/{[^}]*"listen_port":'$listen_port'[^}]*},\?//g')
+                    # 构造匹配模式：包含 listen_port 和 extra（如果有）
+                    local pattern='"listen_port":'$listen_port
+                    if [[ -n "$extra_raw" ]]; then
+                        # 转义 extra_raw 中的特殊字符用于 sed
+                        local escaped_extra=$(echo "$extra_raw" | sed 's/[&/\]/\\&/g')
+                        pattern="${pattern}[^}]*\"extra\":\"${escaped_extra}\""
+                    fi
+                    local new_content=$(echo "$json_content" | sed "s/{[^}]*${pattern}[^}]*},\?//g")
                     echo "$new_content" > "$CONFIG_FILE"
                 fi
                 
@@ -1588,7 +1654,9 @@ view_delete_forward() {
                 esac
                 # UNIX套接字模式不需要移除防火墙规则
                 if [[ ! " $protocols_raw " =~ " unix " ]]; then
-                    remove_firewall_rules "$listen_port" "$ip_type"
+                    # 将JSON数组格式的protocols转换为空格分隔
+                    local fw_protocols=$(echo "$protocols_raw" | tr -d '[]"' | tr ',' ' ')
+                    remove_firewall_rules "$listen_port" "$ip_type" "$fw_protocols"
                 fi
             else
                 echo -e "${Red}无效的编号: $num${Font}"
@@ -1620,17 +1688,25 @@ remove_forward() {
         
         if [[ "$proto" == "unix" ]]; then
             # UNIX协议：需要根据extra路径精确匹配
-            if [[ -n "$extra_raw" && "$extra_raw" == /* ]]; then
+            # 解析extra，提取实际socket路径（支持新格式tcp2unix:/path和旧格式/path）
+            local unix_path=""
+            if [[ "$extra_raw" == tcp2unix:* ]] || [[ "$extra_raw" == unix2tcp:* ]]; then
+                unix_path="${extra_raw#*:}"
+            elif [[ "$extra_raw" == /* ]]; then
+                unix_path="$extra_raw"
+            fi
+            
+            if [[ -n "$unix_path" ]]; then
                 # 遍历所有socat-unix服务，查找匹配的
-                for svc_file in /etc/systemd/system/socat-unix-*.service; do
+                for svc_file in /etc/systemd/system/socat-*-unix-*.service; do
                     [ -f "$svc_file" ] || continue
-                    if grep -q "UNIX-LISTEN:${extra_raw}\|UNIX-CONNECT:${extra_raw}" "$svc_file" 2>/dev/null; then
+                    if grep -q "UNIX-LISTEN:${unix_path}\|UNIX-CONNECT:${unix_path}" "$svc_file" 2>/dev/null; then
                         svc_name=$(basename "$svc_file" .service)
                         systemctl stop "$svc_name" 2>/dev/null
                         systemctl disable "$svc_name" 2>/dev/null
                         rm -f "$svc_file"
                         # 清理UNIX socket文件
-                        rm -f "$extra_raw" 2>/dev/null
+                        rm -f "$unix_path" 2>/dev/null
                         removed_count=$((removed_count + 1))
                     fi
                 done
@@ -1675,6 +1751,7 @@ remove_forward() {
 configure_firewall() {
     local port=$1
     local ip_version=$2
+    local protocols=$3  # 空格分隔的协议列表，如 "tcp udp sctp"
     
     # 标准化IP版本参数
     case "$ip_version" in
@@ -1689,9 +1766,34 @@ configure_firewall() {
         return 0
     }
     
+    # 计算需要开放的防火墙协议（基于转发协议推导）
+    local fw_protocols=""
+    if [[ -z "$protocols" ]]; then
+        fw_protocols="tcp udp"
+    else
+        for proto in $protocols; do
+            case "$proto" in
+                tcp|udp|sctp)
+                    fw_protocols="$fw_protocols $proto"
+                    ;;
+                openssl|socks|proxy)
+                    # 这些都是基于TCP的
+                    [[ ! " $fw_protocols " =~ " tcp " ]] && fw_protocols="$fw_protocols tcp"
+                    ;;
+                unix)
+                    # UNIX套接字不需要防火墙
+                    ;;
+            esac
+        done
+    fi
+    fw_protocols=$(echo "$fw_protocols" | xargs)  # trim
+    
+    [[ -z "$fw_protocols" ]] && return 0
+    
     # 统一配置防火墙规则
-    if configure_firewall_rules "$firewall_type" "$port" "$ip_version"; then
-        echo -e "${Green}已为 ${ip_version} 端口 ${port} 配置防火墙规则 (TCP/UDP)${Font}"
+    if configure_firewall_rules "$firewall_type" "$port" "$ip_version" "$fw_protocols"; then
+        local proto_display=$(echo "$fw_protocols" | tr ' ' '/' | tr 'a-z' 'A-Z')
+        echo -e "${Green}已为 ${ip_version} 端口 ${port} 配置防火墙规则 (${proto_display})${Font}"
     else
         echo -e "${Yellow}防火墙配置失败或无权限，请手动配置端口 ${port}${Font}"
     fi
@@ -1718,6 +1820,12 @@ configure_firewall_rules() {
     local firewall_type=$1
     local port=$2
     local ip_version=$3
+    local protocols=$4  # 空格分隔的协议列表，如 "tcp udp sctp"
+    
+    # 默认协议
+    if [[ -z "$protocols" ]]; then
+        protocols="tcp udp"
+    fi
     
     case "$firewall_type" in
         firewalld)
@@ -1725,13 +1833,13 @@ configure_firewall_rules() {
             local ipv6_flag=""
             [[ "$ip_version" == "ipv6" ]] && ipv6_flag="--ipv6"
             
-            for protocol in tcp udp; do
+            for protocol in $protocols; do
                 firewall-cmd --zone="$zone" --add-port="${port}/${protocol}" --permanent $ipv6_flag 2>/dev/null || return 1
             done
             firewall-cmd --reload 2>/dev/null || return 1
             ;;
         ufw)
-            for protocol in tcp udp; do
+            for protocol in $protocols; do
                 ufw allow "${port}/${protocol}" 2>/dev/null || return 1
             done
             ;;
@@ -1739,7 +1847,7 @@ configure_firewall_rules() {
             local cmd="iptables"
             [[ "$ip_version" == "ipv6" ]] && cmd="ip6tables"
             
-            for protocol in tcp udp; do
+            for protocol in $protocols; do
                 $cmd -C INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || \
                 $cmd -I INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || return 1
             done
@@ -1756,6 +1864,7 @@ configure_firewall_rules() {
 remove_firewall_rules() {
     local port=$1
     local ip_type=$2
+    local protocols=$3  # 空格分隔的协议列表（可选）
     
     # 标准化IP版本参数
     case "$ip_type" in
@@ -1770,9 +1879,15 @@ remove_firewall_rules() {
         return 0
     }
     
+    # 如果没有指定协议，尝试移除所有可能的协议
+    if [[ -z "$protocols" ]]; then
+        protocols="tcp udp sctp"
+    fi
+    
     # 统一移除防火墙规则
-    if remove_firewall_rules_by_type "$firewall_type" "$port" "$ip_type"; then
-        echo -e "${Green}已移除端口 ${port} 的防火墙规则 (TCP/UDP)${Font}"
+    if remove_firewall_rules_by_type "$firewall_type" "$port" "$ip_type" "$protocols"; then
+        local proto_display=$(echo "$protocols" | tr ' ' '/' | tr 'a-z' 'A-Z')
+        echo -e "${Green}已移除端口 ${port} 的防火墙规则 (${proto_display})${Font}"
     else
         echo -e "${Yellow}防火墙规则移除失败或无权限${Font}"
     fi
@@ -1783,6 +1898,9 @@ remove_firewall_rules_by_type() {
     local firewall_type=$1
     local port=$2
     local ip_type=$3
+    local protocols=$4  # 空格分隔的协议列表
+    
+    [[ -z "$protocols" ]] && protocols="tcp udp sctp"
     
     case "$firewall_type" in
         firewalld)
@@ -1790,21 +1908,21 @@ remove_firewall_rules_by_type() {
             local ipv6_flag=""
             [[ "$ip_type" == "ipv6" ]] && ipv6_flag="--ipv6"
             
-            for protocol in tcp udp; do
-                firewall-cmd --zone="$zone" --remove-port="${port}/${protocol}" --permanent $ipv6_flag 2>/dev/null || return 1
+            for protocol in $protocols; do
+                firewall-cmd --zone="$zone" --remove-port="${port}/${protocol}" --permanent $ipv6_flag 2>/dev/null || continue
             done
             firewall-cmd --reload 2>/dev/null || return 1
             ;;
         ufw)
-            for protocol in tcp udp; do
-                ufw delete allow "${port}/${protocol}" 2>/dev/null || return 1
+            for protocol in $protocols; do
+                ufw delete allow "${port}/${protocol}" 2>/dev/null || continue
             done
             ;;
         iptables)
             local cmd="iptables"
             [[ "$ip_type" == "ipv6" ]] && cmd="ip6tables"
             
-            for protocol in tcp udp; do
+            for protocol in $protocols; do
                 $cmd -D INPUT -p "$protocol" --dport "$port" -j ACCEPT 2>/dev/null || continue
             done
             ;;
@@ -1888,8 +2006,16 @@ restore_forwards() {
                 
                 # 显示extra信息
                 if [[ -n "$extra_raw" && "$extra_raw" != "null" ]]; then
-                    [[ "$extra_raw" == /* ]] && echo "  UNIX套接字: $extra_raw"
-                    [[ "$extra_raw" == *:* ]] && echo "  代理: $extra_raw"
+                    if [[ "$extra_raw" == tcp2unix:* ]] || [[ "$extra_raw" == unix2tcp:* ]]; then
+                        local display_unix="${extra_raw#*:}"
+                        local dir_label="TCP->UNIX"
+                        [[ "$extra_raw" == unix2tcp:* ]] && dir_label="UNIX->TCP"
+                        echo "  UNIX套接字: $display_unix ($dir_label)"
+                    elif [[ "$extra_raw" == /* ]]; then
+                        echo "  UNIX套接字: $extra_raw"
+                    elif [[ "$extra_raw" == *:* && "$extra_raw" != tcp2unix:* && "$extra_raw" != unix2tcp:* ]]; then
+                        echo "  代理: $extra_raw"
+                    fi
                 fi
                 
                 # 域名监控恢复信息
