@@ -962,6 +962,15 @@ config_socat(){
                 fi
             done
         fi
+    else
+        # UNIX模式：设置显示用的占位地址（非真实地址，用于日志显示）
+        if [ "$unix_dir" == "1" ]; then
+            # TCP -> UNIX：远程地址显示为UNIX socket路径
+            socatip="${extra_config}"
+        else
+            # UNIX -> TCP：远程地址显示为127.0.0.1:端口
+            socatip="127.0.0.1:${port2}"
+        fi
     fi
 }
 
@@ -1158,10 +1167,22 @@ create_single_socat_service() {
             fi
             ;;
         unix)
-            if [ "$target_ip" == "unix_listen" ]; then
-                socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} UNIX-CONNECT:${extra}"
+            # extra: UNIX socket 路径
+            # socatip: "unix_listen"=TCP->UNIX, "unix_connect"=UNIX->TCP (通过extra判断)
+            # 通过 extra 是否为绝对路径来判断方向
+            if [[ "$extra" == /* ]]; then
+                # extra 是绝对路径，说明是配置时传入的
+                # socatip 如果等于 extra，说明是 TCP->UNIX 模式
+                if [[ "$target_ip" == "$extra" ]] || [[ "$target_ip" == "127.0.0.1:${target_port}" ]]; then
+                    # UNIX -> TCP 模式
+                    socat_cmd="/usr/bin/socat UNIX-LISTEN:${extra},reuseaddr,fork,unlink-early TCP4:127.0.0.1:${target_port},connect-timeout=10"
+                else
+                    # TCP -> UNIX 模式
+                    socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} UNIX-CONNECT:${extra}"
+                fi
             else
-                socat_cmd="/usr/bin/socat UNIX-LISTEN:${extra},reuseaddr,fork,unlink-early TCP4:127.0.0.1:${target_port},connect-timeout=10"
+                # 兼容旧配置：extra 可能不存在
+                socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} UNIX-CONNECT:${target_ip}"
             fi
             ;;
         socks)
@@ -1259,10 +1280,10 @@ start_socat(){
         # UNIX模式特殊显示
         if [[ " ${forward_protocols[*]} " =~ " unix " ]]; then
             echo -e "${Blue}UNIX套接字路径: ${extra_config}${Font}"
-            if [ "$socatip" == "unix_listen" ]; then
+            if [[ "$socatip" == "$extra_config" ]]; then
                 echo -e "${Blue}方向: TCP端口 ${port1} -> UNIX套接字${Font}"
             else
-                echo -e "${Blue}方向: UNIX套接字 -> 127.0.0.1:${port2}${Font}"
+                echo -e "${Blue}方向: UNIX套接字 -> ${socatip}${Font}"
             fi
         else
             echo -e "${Blue}本地端口: ${port1}${Font}"
@@ -1385,25 +1406,37 @@ view_delete_forward() {
             local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
             local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
             local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
+            local protocols_raw=$(echo "$config" | grep -o '"protocols":"[^"]*"' | cut -d'"' -f4)
+            local extra_raw=$(echo "$config" | grep -o '"extra":"[^"]*"' | cut -d'"' -f4)
             
             [ -z "$ip_type" ] && continue
             
-            entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            local proto_display="TCP/UDP"
+            if [[ -n "$protocols_raw" ]]; then
+                proto_display=$(echo "$protocols_raw" | tr -d '[]"' | sed 's/,/\//g' | tr 'a-z' 'A-Z')
+            fi
+            
+            entries+=("$ip_type $listen_port $remote_ip $remote_port $protocols_raw $extra_raw")
             local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
-                    echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
+                    echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port ($proto_display)"
                     ;;
                 "ipv6")
-                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port ($proto_display)"
                     ;;
                 "domain")
-                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
+                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port ($proto_display) [DDNS, IPv4]"
                     ;;
                 "domain6")
-                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port ($proto_display) [DDNS, IPv6]"
                     ;;
             esac
+            # 显示extra信息
+            if [[ -n "$extra_raw" ]]; then
+                [[ "$extra_raw" == /* ]] && echo "   UNIX套接字: $extra_raw"
+                [[ "$extra_raw" == *:* ]] && echo "   代理: $extra_raw"
+            fi
             ((i++))
         done
     fi
