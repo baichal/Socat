@@ -440,6 +440,84 @@ format_json_config() {
     fi
 }
 
+# 从JSON配置文件提取所有对象（无jq回退辅助函数）
+json_extract_objects() {
+    local file="$1"
+    local content=$(cat "$file" 2>/dev/null | tr -d '\n')
+    
+    local objects=()
+    local current=""
+    local brace_count=0
+    local in_object=false
+    
+    local i=0
+    local len=${#content}
+    while [ $i -lt $len ]; do
+        local char="${content:$i:1}"
+        case "$char" in
+            '{')
+                if [ $brace_count -eq 0 ]; then
+                    in_object=true
+                    current="{"
+                else
+                    current="$current{"
+                fi
+                brace_count=$((brace_count + 1))
+                ;;
+            '}')
+                current="$current}"
+                brace_count=$((brace_count - 1))
+                if [ $brace_count -eq 0 ] && [ "$in_object" = true ]; then
+                    objects+=("$current")
+                    in_object=false
+                    current=""
+                fi
+                ;;
+            *)
+                if [ "$in_object" = true ]; then
+                    current="$current$char"
+                fi
+                ;;
+        esac
+        i=$((i + 1))
+    done
+    
+    for obj in "${objects[@]}"; do
+        echo "$obj"
+    done
+}
+
+# 从JSON对象字符串中提取字段值（无jq回退辅助函数）
+# 支持字符串、数字、数组值
+json_extract_field() {
+    local json_str="$1"
+    local field_name="$2"
+    
+    # 尝试匹配字符串值: "field":"value"
+    local str_val=$(echo "$json_str" | grep -o '"'"$field_name"'":"[^"]*"' | head -n1 | sed 's/^"[^"]*":"//;s/"$//')
+    if [[ -n "$str_val" ]]; then
+        echo "$str_val"
+        return 0
+    fi
+    
+    # 尝试匹配数字值: "field":123
+    local num_val=$(echo "$json_str" | grep -o '"'"$field_name"'":[0-9]*' | head -n1 | sed 's/^"[^"]*"://')
+    if [[ -n "$num_val" ]]; then
+        echo "$num_val"
+        return 0
+    fi
+    
+    # 尝试匹配数组值: "field":["a","b"]
+    local arr_val=$(echo "$json_str" | grep -o '"'"$field_name"'":\[[^]]*\]' | head -n1 | sed 's/^"[^"]*":\[//;s/\]$//' | tr -d '"' | tr ',' ' ')
+    if [[ -n "$arr_val" ]]; then
+        echo "$arr_val"
+        return 0
+    fi
+    
+    echo ""
+    return 1
+}
+
 # 修复JSON配置文件格式（兼容旧函数名）
 fix_json_format() {
     format_json_config "$CONFIG_FILE" "$JSON_FORMAT_ENABLED"
@@ -640,17 +718,24 @@ check_port() {
     local port=$1
     local protocol=${2:-"tcp"}
     
+    # SCTP等非TCP/UDP协议，跳过检测
+    if [[ "$protocol" != "tcp" && "$protocol" != "udp" ]]; then
+        return 0
+    fi
+    
+    local proto_flag="${protocol:0:1}"
+    
     # 使用ss命令（优先）
     if command -v ss >/dev/null 2>&1; then
-        if ss -${protocol:0:1}ln | grep -q ":${port} "; then
-            local process=$(ss -${protocol:0:1}lnp | grep ":${port} " | awk '{print $7}' | cut -d',' -f1 | cut -d'"' -f2 | head -n1)
+        if ss -${proto_flag}ln | grep -q ":${port} "; then
+            local process=$(ss -${proto_flag}lnp | grep ":${port} " | awk '{print $7}' | cut -d',' -f1 | cut -d'"' -f2 | head -n1)
             echo -e "${Red}错误: 端口 $1 已被占用 (${process:-未知进程})${Font}"
             return 1
         fi
     # 备选使用netstat
     elif command -v netstat >/dev/null 2>&1; then
-        if netstat -${protocol:0:1}uln | grep -q ":${port} "; then
-            local process=$(netstat -${protocol:0:1}ulnp | grep ":${port} " | awk '{print $7}' | cut -d'/' -f2 | head -n1)
+        if netstat -${proto_flag}ln | grep -q ":${port} "; then
+            local process=$(netstat -${proto_flag}lnp | grep ":${port} " | awk '{print $7}' | cut -d'/' -f2 | head -n1)
             echo -e "${Red}错误: 端口 $1 已被占用 (${process:-未知进程})${Font}"
             return 1
         fi
@@ -1121,6 +1206,11 @@ create_single_socat_service() {
     local service_name="socat-${listen_port}-${target_port}-${protocol}"
     local socat_cmd=""
     
+    # UNIX -> TCP 模式时，listen_port 可能为0，用 target_port 作服务名标识
+    if [ "$protocol" == "unix" ] && [ "$listen_port" == "0" ]; then
+        service_name="socat-unix-${target_port}-${protocol}"
+    fi
+    
     # TCP 通用选项
     local tcp_common_opts="reuseaddr,fork,so-keepalive,so-sndbuf=1048576,so-rcvbuf=1048576"
     
@@ -1247,14 +1337,20 @@ start_socat(){
     local service_names=()
     for proto in "${forward_protocols[@]}"; do
         create_single_socat_service "$proto" "$ip_type_num" "$port1" "$socatip" "$port2" "$extra_config"
-        # 服务名用于后续状态检查
-        service_names+=("socat-${port1}-${port2}-${proto}")
+        # 服务名用于后续状态检查，UNIX模式特殊处理
+        if [ "$proto" == "unix" ] && [ "$port1" == "0" ]; then
+            service_names+=("socat-unix-${port2}-${proto}")
+        else
+            service_names+=("socat-${port1}-${port2}-${proto}")
+        fi
     done
     
-    # 如果是域名类型，设置监控（仅TCP类协议有效）
+    # 如果是域名类型，设置监控（仅TCP类协议有效，排除UNIX和代理协议）
     if [ "$ip_version" == "3" ] || [ "$ip_version" == "4" ]; then
-        if [[ " ${forward_protocols[*]} " =~ " tcp " ]] || [[ " ${forward_protocols[*]} " =~ " openssl " ]]; then
-            setup_domain_monitor "$socatip" "$port1" "$ip_type_num" "$port2"
+        if [[ " ${forward_protocols[*]} " =~ " tcp " ]] || [[ " ${forward_protocols[*]} " =~ " openssl " ]] || [[ " ${forward_protocols[*]} " =~ " sctp " ]]; then
+            if [[ ! " ${forward_protocols[*]} " =~ " socks " ]] && [[ ! " ${forward_protocols[*]} " =~ " proxy " ]]; then
+                setup_domain_monitor "$socatip" "$port1" "$ip_type_num" "$port2" "${forward_protocols[*]}"
+            fi
         fi
     fi
 
@@ -1320,7 +1416,10 @@ start_socat(){
         esac
 
         add_to_config
-        configure_firewall ${port1} "$firewall_type"
+        # UNIX套接字模式不需要配置防火墙
+        if [[ ! " ${forward_protocols[*]} " =~ " unix " ]]; then
+            configure_firewall ${port1} "$firewall_type"
+        fi
         return 0
     else
         echo -e "${Red}Socat启动失败，请检查系统日志。${Font}"
@@ -1395,24 +1494,24 @@ view_delete_forward() {
             ((i++))
         done <<< "$configs"
     else
-        # 回退到基于行的JSON解析
-        local json_content=$(cat "$CONFIG_FILE")
-        local count=$(echo "$json_content" | grep -o '"type"' | wc -l)
+        # 回退到基于字符解析的JSON提取
+        local configs=$(json_extract_objects "$CONFIG_FILE")
         
-        for j in $(seq 0 $(($count-1))); do
-            local config=$(echo "$json_content" | sed -n 's/.*{\([^}]*\)}.*/\1/p' | sed -n "$((j+1))p")
-            local ip_type=$(echo "$config" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
-            local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
-            local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
-            local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
-            local protocols_raw=$(echo "$config" | grep -o '"protocols":"[^"]*"' | cut -d'"' -f4)
-            local extra_raw=$(echo "$config" | grep -o '"extra":"[^"]*"' | cut -d'"' -f4)
+        while IFS= read -r config; do
+            [[ -z "$config" ]] && continue
+            
+            local ip_type=$(json_extract_field "$config" "type")
+            local listen_port=$(json_extract_field "$config" "listen_port")
+            local remote_ip=$(json_extract_field "$config" "remote_ip")
+            local remote_port=$(json_extract_field "$config" "remote_port")
+            local protocols_raw=$(json_extract_field "$config" "protocols")
+            local extra_raw=$(json_extract_field "$config" "extra")
             
             [ -z "$ip_type" ] && continue
             
             local proto_display="TCP/UDP"
             if [[ -n "$protocols_raw" ]]; then
-                proto_display=$(echo "$protocols_raw" | tr -d '[]"' | sed 's/,/\//g' | tr 'a-z' 'A-Z')
+                proto_display=$(echo "$protocols_raw" | tr ' ' '/' | tr 'a-z' 'A-Z')
             fi
             
             entries+=("$ip_type $listen_port $remote_ip $remote_port $protocols_raw $extra_raw")
@@ -1437,7 +1536,7 @@ view_delete_forward() {
                 [[ "$extra_raw" == *:* ]] && echo "   代理: $extra_raw"
             fi
             ((i++))
-        done
+        done <<< "$configs"
     fi
 
     read -p "请输入要删除的转发编号（多个编号用空格分隔，直接回车取消）: " numbers
@@ -1460,7 +1559,7 @@ view_delete_forward() {
                     proto_display=$(echo "$protocols_raw" | tr -d '[]"' | sed 's/,/ \/ /g' | tr 'a-z' 'A-Z')
                 fi
                 
-                remove_forward "$listen_port" "$ip_type" "$protocols_raw"
+                remove_forward "$listen_port" "$ip_type" "$protocols_raw" "$extra_raw"
                 
                 # 从JSON配置中删除
                 if command -v jq >/dev/null 2>&1; then
@@ -1487,7 +1586,10 @@ view_delete_forward() {
                         echo -e "${Green}已删除IPv6 域名转发: [$local_ipv6]:$listen_port --> $remote_ip ($proto_display) [IPv6]${Font}"
                         ;;
                 esac
-                remove_firewall_rules "$listen_port" "$ip_type"
+                # UNIX套接字模式不需要移除防火墙规则
+                if [[ ! " $protocols_raw " =~ " unix " ]]; then
+                    remove_firewall_rules "$listen_port" "$ip_type"
+                fi
             else
                 echo -e "${Red}无效的编号: $num${Font}"
             fi
@@ -1499,13 +1601,66 @@ view_delete_forward() {
 remove_forward() {
     local listen_port=$1
     local ip_type=$2
-    local protocols_raw=$3
-    local service_name="socat-${listen_port}-*"
+    local protocols_raw=$3  # 空格分隔的协议列表，如 "tcp udp"
+    local extra_raw=$4      # 额外参数（UNIX路径/代理地址）
     
-    # 停止并移除socat服务
-    systemctl stop ${service_name} 2>/dev/null
-    systemctl disable ${service_name} 2>/dev/null
-    rm -f /etc/systemd/system/${service_name}.service
+    # 解析协议列表
+    local protocols=()
+    if [[ -n "$protocols_raw" && "$protocols_raw" != "null" ]]; then
+        protocols=($protocols_raw)
+    else
+        protocols=("tcp" "udp")
+    fi
+    
+    local removed_count=0
+    
+    # 根据协议精确移除服务
+    for proto in "${protocols[@]}"; do
+        local svc_name=""
+        
+        if [[ "$proto" == "unix" ]]; then
+            # UNIX协议：需要根据extra路径精确匹配
+            if [[ -n "$extra_raw" && "$extra_raw" == /* ]]; then
+                # 遍历所有socat-unix服务，查找匹配的
+                for svc_file in /etc/systemd/system/socat-unix-*.service; do
+                    [ -f "$svc_file" ] || continue
+                    if grep -q "UNIX-LISTEN:${extra_raw}\|UNIX-CONNECT:${extra_raw}" "$svc_file" 2>/dev/null; then
+                        svc_name=$(basename "$svc_file" .service)
+                        systemctl stop "$svc_name" 2>/dev/null
+                        systemctl disable "$svc_name" 2>/dev/null
+                        rm -f "$svc_file"
+                        # 清理UNIX socket文件
+                        rm -f "$extra_raw" 2>/dev/null
+                        removed_count=$((removed_count + 1))
+                    fi
+                done
+            fi
+        else
+            # 普通协议：使用精确服务名
+            # 需要找到remote_port，这里用通配符但限定协议
+            for svc_file in /etc/systemd/system/socat-${listen_port}-*-${proto}.service; do
+                [ -f "$svc_file" ] || continue
+                svc_name=$(basename "$svc_file" .service)
+                systemctl stop "$svc_name" 2>/dev/null
+                systemctl disable "$svc_name" 2>/dev/null
+                rm -f "$svc_file"
+                removed_count=$((removed_count + 1))
+            done
+        fi
+    done
+    
+    # 如果上述精确匹配没有找到（兼容旧配置），尝试使用listen_port通配符
+    if [[ $removed_count -eq 0 ]] && [[ "$listen_port" != "0" ]]; then
+        for svc_file in /etc/systemd/system/socat-${listen_port}-*.service; do
+            [ -f "$svc_file" ] || continue
+            local svc_name=$(basename "$svc_file" .service)
+            systemctl stop "$svc_name" 2>/dev/null
+            systemctl disable "$svc_name" 2>/dev/null
+            rm -f "$svc_file"
+            removed_count=$((removed_count + 1))
+        done
+    fi
+    
     systemctl daemon-reload
     
     # 如果是域名类型，移除域名监控服务
@@ -1513,7 +1668,7 @@ remove_forward() {
         remove_domain_monitor "$listen_port"
     fi
     
-    echo -e "${Green}已移除端口 ${listen_port} 的转发${Font}"
+    echo -e "${Green}已移除 ${removed_count} 个转发服务${Font}"
 }
 
 # 防火墙检测和配置
@@ -1705,10 +1860,12 @@ restore_forwards() {
                     create_single_socat_service "$proto" "$ip_version" "$listen_port" "$remote_ip" "$remote_port" "$extra_raw"
                 done
                 
-                # 如果是域名类型，恢复监控
+                # 如果是域名类型，恢复监控（排除代理协议）
                 if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-                    if [[ " ${restore_protocols[*]} " =~ " tcp " ]] || [[ " ${restore_protocols[*]} " =~ " openssl " ]]; then
-                        setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+                    if [[ " ${restore_protocols[*]} " =~ " tcp " ]] || [[ " ${restore_protocols[*]} " =~ " openssl " ]] || [[ " ${restore_protocols[*]} " =~ " sctp " ]]; then
+                        if [[ ! " ${restore_protocols[*]} " =~ " socks " ]] && [[ ! " ${restore_protocols[*]} " =~ " proxy " ]]; then
+                            setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port" "${restore_protocols[*]}"
+                        fi
                     fi
                 fi
                 
@@ -1741,18 +1898,18 @@ restore_forwards() {
                 fi
             done <<< "$configs"
         else
-            # 回退到基于行的JSON解析
-            local json_content=$(cat "$CONFIG_FILE")
-            local count=$(echo "$json_content" | grep -o '"type"' | wc -l)
+            # 回退到基于字符解析的JSON提取
+            local configs=$(json_extract_objects "$CONFIG_FILE")
             
-            for i in $(seq 0 $(($count-1))); do
-                local config=$(echo "$json_content" | sed -n 's/.*{\([^}]*\)}.*/\1/p' | sed -n "$((i+1))p")
-                local ip_type=$(echo "$config" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
-                local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
-                local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
-                local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
-                local protocols_raw=$(echo "$config" | grep -o '"protocols":"[^"]*"' | cut -d'"' -f4)
-                local extra_raw=$(echo "$config" | grep -o '"extra":"[^"]*"' | cut -d'"' -f4)
+            while IFS= read -r config; do
+                [[ -z "$config" ]] && continue
+                
+                local ip_type=$(json_extract_field "$config" "type")
+                local listen_port=$(json_extract_field "$config" "listen_port")
+                local remote_ip=$(json_extract_field "$config" "remote_ip")
+                local remote_port=$(json_extract_field "$config" "remote_port")
+                local protocols_raw=$(json_extract_field "$config" "protocols")
+                local extra_raw=$(json_extract_field "$config" "extra")
                 
                 [ -z "$ip_type" ] && continue
                 
@@ -1769,7 +1926,7 @@ restore_forwards() {
                 # 解析协议列表
                 local restore_protocols=()
                 if [[ -n "$protocols_raw" ]]; then
-                    restore_protocols=($(echo "$protocols_raw" | tr -d '[]"' | tr ',' ' '))
+                    restore_protocols=($protocols_raw)
                 else
                     restore_protocols=("tcp" "udp")
                 fi
@@ -1806,12 +1963,12 @@ restore_forwards() {
                 fi
                 
                 if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-                    if [[ " ${restore_protocols[*]} " =~ " tcp " ]] || [[ " ${restore_protocols[*]} " =~ " openssl " ]]; then
-                        setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+                    if [[ " ${restore_protocols[*]} " =~ " tcp " ]] || [[ " ${restore_protocols[*]} " =~ " openssl " ]] || [[ " ${restore_protocols[*]} " =~ " sctp " ]]; then
+                        setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port" "${restore_protocols[*]}"
                         echo "已恢复域名 ${remote_ip} 的IP监控服务"
                     fi
                 fi
-            done
+            done <<< "$configs"
         fi
     fi
 }
@@ -2275,6 +2432,7 @@ setup_domain_monitor() {
     local listen_port=$2
     local ip_type=$3
     local remote_port=$4
+    local protocols_raw=$5  # 协议列表，空格分隔，如 "tcp udp openssl"
     
     local monitor_script="$SOCATS_DIR/monitor_${listen_port}.sh"
     
@@ -2290,6 +2448,7 @@ LISTEN_PORT="$2"
 IP_TYPE="$3"
 REMOTE_PORT="$4"
 SOCATS_DIR="$5"
+PROTOCOLS="$6"  # 协议列表，空格分隔
 
 # 监控域名IP变更的函数
 monitor_domain_ip() {
@@ -2340,11 +2499,21 @@ monitor_domain_ip() {
         echo "$(date): 检测到域名 $domain 的IP变更: $cached_ip -> $current_ip" >> "${SOCATS_DIR}/dns_monitor.log"
         echo "$current_ip" > "$cache_file"
         
-        # 重启对应的socat服务（精确指定TCP和UDP服务）
-        local tcp_service="socat-${LISTEN_PORT}-${REMOTE_PORT}-tcp"
-        local udp_service="socat-${LISTEN_PORT}-${REMOTE_PORT}-udp"
-        systemctl restart "$tcp_service" "$udp_service" 2>/dev/null
-        echo "$(date): 已重启转发服务 $tcp_service $udp_service" >> "${SOCATS_DIR}/dns_monitor.log"
+        # 根据协议列表重启对应的socat服务
+        local services_to_restart=()
+        for proto in $PROTOCOLS; do
+            local svc_name="socat-${LISTEN_PORT}-${REMOTE_PORT}-${proto}"
+            if systemctl list-unit-files "${svc_name}.service" >/dev/null 2>&1; then
+                services_to_restart+=("${svc_name}.service")
+            fi
+        done
+        
+        if [ ${#services_to_restart[@]} -gt 0 ]; then
+            systemctl restart "${services_to_restart[@]}" 2>/dev/null
+            echo "$(date): 已重启转发服务: ${services_to_restart[*]}" >> "${SOCATS_DIR}/dns_monitor.log"
+        else
+            echo "$(date): 未找到匹配的转发服务，跳过重启" >> "${SOCATS_DIR}/dns_monitor.log"
+        fi
         return 0
     fi
     
@@ -2373,7 +2542,7 @@ After=network.target
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash $monitor_script "${domain}" "${listen_port}" "${ip_type}" "${remote_port}" "${SOCATS_DIR}"
+ExecStart=/bin/bash $monitor_script "${domain}" "${listen_port}" "${ip_type}" "${remote_port}" "${SOCATS_DIR}" "${protocols_raw}"
 
 [Install]
 WantedBy=multi-user.target
@@ -2416,8 +2585,17 @@ remove_domain_monitor() {
     if command -v jq >/dev/null 2>&1; then
         domain=$(jq -r --argjson port "$listen_port" '.[] | select(.listen_port == $port and (.type == "domain" or .type == "domain6")) | .remote_ip' "$CONFIG_FILE" 2>/dev/null)
     else
-        # 从配置文件中提取域名
-        domain=$(grep -o '"listen_port":'$listen_port'[^}]*' "$CONFIG_FILE" | grep -o '"remote_ip":"[^"]*"' | head -n1 | cut -d'"' -f4)
+        # 从配置文件中提取域名（无jq回退）
+        local configs=$(json_extract_objects "$CONFIG_FILE")
+        while IFS= read -r config; do
+            [[ -z "$config" ]] && continue
+            local cfg_port=$(json_extract_field "$config" "listen_port")
+            local cfg_type=$(json_extract_field "$config" "type")
+            if [[ "$cfg_port" == "$listen_port" ]] && [[ "$cfg_type" == "domain" || "$cfg_type" == "domain6" ]]; then
+                domain=$(json_extract_field "$config" "remote_ip")
+                break
+            fi
+        done <<< "$configs"
     fi
     
     if [[ -n "$domain" ]]; then
@@ -2487,16 +2665,16 @@ change_monitor_interval() {
             fi
         done <<< "$configs"
     else
-        # 回退到基于行的JSON解析
-        local json_content=$(cat "$CONFIG_FILE")
-        local count=$(echo "$json_content" | grep -o '"type"' | wc -l)
+        # 回退到基于字符解析的JSON提取
+        local configs=$(json_extract_objects "$CONFIG_FILE")
         
-        for j in $(seq 0 $(($count-1))); do
-            local config=$(echo "$json_content" | sed -n 's/.*{\([^}]*\)}.*/\1/p' | sed -n "$((j+1))p")
-            local ip_type=$(echo "$config" | grep -o '"type":"[^"]*"' | cut -d'"' -f4)
-            local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
-            local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
-            local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
+        while IFS= read -r config; do
+            [[ -z "$config" ]] && continue
+            
+            local ip_type=$(json_extract_field "$config" "type")
+            local listen_port=$(json_extract_field "$config" "listen_port")
+            local remote_ip=$(json_extract_field "$config" "remote_ip")
+            local remote_port=$(json_extract_field "$config" "remote_port")
             
             [ -z "$ip_type" ] && continue
             
@@ -2510,7 +2688,7 @@ change_monitor_interval() {
                 fi
                 ((i++))
             fi
-        done
+        done <<< "$configs"
     fi
     
     if [ "$has_domain" == "false" ]; then
