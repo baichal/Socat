@@ -407,11 +407,6 @@ A: 当前脚本使用自签名证书，如需双向认证请手动配置证书�
 
 A: 可通过 iptables 或 tc 命令限制带宽，脚本暂不内置此功能。
 
-## 技术支持
-
-- **GitHub Issues**: https://github.com/example/socat.sh/issues
-- **讨论群组**: 加入 Telegram 群组获取帮助
-
 ## 许可证
 
 MIT License
