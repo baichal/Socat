@@ -494,21 +494,21 @@ json_extract_field() {
     local field_name="$2"
     
     # 尝试匹配字符串值: "field":"value"
-    local str_val=$(echo "$json_str" | grep -o '"'"$field_name"'":"[^"]*"' | head -n1 | sed 's/^"[^"]*":"//;s/"$//')
+    local str_val=$(echo "$json_str" | grep -oE "\"${field_name}\":\"[^\"]*\"" | head -n1 | sed 's/^[^:]*://;s/"$//;s/^"//')
     if [[ -n "$str_val" ]]; then
         echo "$str_val"
         return 0
     fi
     
     # 尝试匹配数字值: "field":123
-    local num_val=$(echo "$json_str" | grep -o '"'"$field_name"'":[0-9]*' | head -n1 | sed 's/^"[^"]*"://')
+    local num_val=$(echo "$json_str" | grep -oE "\"${field_name}\":[0-9]+" | head -n1 | sed 's/^[^:]*://')
     if [[ -n "$num_val" ]]; then
         echo "$num_val"
         return 0
     fi
     
     # 尝试匹配数组值: "field":["a","b"]
-    local arr_val=$(echo "$json_str" | grep -o '"'"$field_name"'":\[[^]]*\]' | head -n1 | sed 's/^"[^"]*":\[//;s/\]$//' | tr -d '"' | tr ',' ' ')
+    local arr_val=$(echo "$json_str" | grep -oE "\"${field_name}\":\[[^\]]*\]" | head -n1 | sed 's/^[^:]*:\[\(.*\)\]/\1/' | tr -d '"' | tr ',' ' ')
     if [[ -n "$arr_val" ]]; then
         echo "$arr_val"
         return 0
@@ -1296,10 +1296,15 @@ create_single_socat_service() {
                 # 旧格式兼容：纯路径
                 unix_path="$extra"
                 # 通过 target_ip 判断方向
-                if [[ "$target_ip" == "127.0.0.1:${target_port}" ]]; then
-                    unix_direction="unix2tcp"
-                elif [[ "$target_ip" == "$extra" ]]; then
+                # - 如果 target_ip 等于 extra 路径本身：TCP->UNIX（target_ip存的是socket路径）
+                # - 如果 target_ip 是 "127.0.0.1" 或 "127.0.0.1:端口"：UNIX->TCP
+                if [[ "$target_ip" == "$extra" ]]; then
                     unix_direction="tcp2unix"
+                elif [[ "$target_ip" == "127.0.0.1" ]]; then
+                    unix_direction="unix2tcp"
+                elif [[ "$target_ip" == 127.0.0.1:* ]]; then
+                    # 旧格式：127.0.0.1:端口
+                    unix_direction="unix2tcp"
                 else
                     unix_direction="tcp2unix"  # 默认TCP->UNIX
                 fi
@@ -1669,13 +1674,21 @@ view_delete_forward() {
 remove_forward() {
     local listen_port=$1
     local ip_type=$2
-    local protocols_raw=$3  # 空格分隔的协议列表，如 "tcp udp"
+    local protocols_raw=$3  # JSON数组格式（如 ["tcp","udp"]）或空格分隔格式
     local extra_raw=$4      # 额外参数（UNIX路径/代理地址）
     
-    # 解析协议列表
+    # 解析协议列表（支持JSON数组格式和空格分隔格式）
     local protocols=()
     if [[ -n "$protocols_raw" && "$protocols_raw" != "null" ]]; then
-        protocols=($protocols_raw)
+        # 检测是否为JSON数组格式（包含 [ 或 ]）
+        if [[ "$protocols_raw" == *'['* ]] || [[ "$protocols_raw" == *']'* ]]; then
+            # JSON数组格式：["tcp","udp"] -> tcp udp
+            local parsed=$(echo "$protocols_raw" | tr -d '[]"' | tr ',' ' ' | xargs)
+            IFS=' ' read -ra protocols <<< "$parsed"
+        else
+            # 空格分隔格式
+            IFS=' ' read -ra protocols <<< "$protocols_raw"
+        fi
     else
         protocols=("tcp" "udp")
     fi
