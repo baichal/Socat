@@ -779,13 +779,21 @@ config_socat(){
     echo
     echo -e "${Green}请选择转发协议：${Font}"
     echo "1. TCP + UDP（默认）"
+    echo "   用途：同时支持 TCP 和 UDP 流量转发，如 SSH、游戏服务器、DNS 等"
     echo "2. 仅 TCP"
+    echo "   用途：仅转发 TCP 流量，如 HTTP/HTTPS 网站、SSH、SMTP 等"
     echo "3. 仅 UDP"
+    echo "   用途：仅转发 UDP 流量，如 DNS、音视频流媒体、游戏等"
     echo "4. SCTP（流控制传输协议）"
+    echo "   用途：支持多流、多宿的传输协议，类似 TCP+多路复用，适合电话信令等"
     echo "5. SSL/TLS 加密转发"
+    echo "   用途：加密 TCP 转发，数据全程加密，防止中间人窃听"
     echo "6. UNIX 域套接字"
+    echo "   用途：将 TCP 端口与本地 UNIX socket 互转，常用于容器/进程通信"
     echo "7. SOCKS4A 代理转发"
+    echo "   用途：通过 SOCKS 代理服务器转发，支持域名解析在代理端完成"
     echo "8. HTTP PROXY 代理转发"
+    echo "   用途：通过 HTTP CONNECT 代理转发，适合 HTTP/HTTPS 流量"
     while true; do
         read -p "请输入选项 [1-8] (默认1): " proto_choice
         proto_choice=${proto_choice:-1}
@@ -835,11 +843,11 @@ config_socat(){
                 if [[ -n "$unix_path" && "$unix_path" == /* ]]; then
                     extra_config="$unix_path"
                     if [ "$unix_dir" == "1" ]; then
-                        # TCP -> UNIX，target_ip标记为unix_listen
-                        socatip="unix_listen"
+                        # TCP -> UNIX：socatip = socket路径，方向由 create_single_socat_service 判断
+                        socatip="$unix_path"
                     else
-                        # UNIX -> TCP，socatip存路径，target_ip设为特殊标记
-                        socatip="unix_connect"
+                        # UNIX -> TCP：socatip 设为特殊值，用于方向判断
+                        socatip="unix_to_tcp"
                     fi
                     break
                 else
@@ -965,10 +973,10 @@ config_socat(){
     else
         # UNIX模式：设置显示用的占位地址（非真实地址，用于日志显示）
         if [ "$unix_dir" == "1" ]; then
-            # TCP -> UNIX：远程地址显示为UNIX socket路径
-            socatip="${extra_config}"
+            # TCP -> UNIX：socatip 已在上面设为 socket 路径
+            :
         else
-            # UNIX -> TCP：远程地址显示为127.0.0.1:端口
+            # UNIX -> TCP：socatip 已在上面设为 unix_to_tcp，这里再覆盖为显示用地址
             socatip="127.0.0.1:${port2}"
         fi
     fi
@@ -1239,17 +1247,8 @@ start_socat(){
     local service_names=()
     for proto in "${forward_protocols[@]}"; do
         create_single_socat_service "$proto" "$ip_type_num" "$port1" "$socatip" "$port2" "$extra_config"
-        if [ "$proto" == "unix" ]; then
-            if [ "$socatip" == "unix_listen" ]; then
-                service_names+=("socat-${port1}-${port2}-${proto}")
-            else
-                # UNIX -> TCP 模式用路径哈希作标识
-                local path_hash=$(echo -n "$extra_config" | md5sum | cut -c1-8)
-                service_names+=("socat-${port1}-${port2}-${proto}")
-            fi
-        else
-            service_names+=("socat-${port1}-${port2}-${proto}")
-        fi
+        # 服务名用于后续状态检查
+        service_names+=("socat-${port1}-${port2}-${proto}")
     done
     
     # 如果是域名类型，设置监控（仅TCP类协议有效）
@@ -1752,6 +1751,8 @@ restore_forwards() {
                 local listen_port=$(echo "$config" | grep -o '"listen_port":[0-9]*' | cut -d':' -f2)
                 local remote_ip=$(echo "$config" | grep -o '"remote_ip":"[^"]*"' | cut -d'"' -f4)
                 local remote_port=$(echo "$config" | grep -o '"remote_port":[0-9]*' | cut -d':' -f2)
+                local protocols_raw=$(echo "$config" | grep -o '"protocols":"[^"]*"' | cut -d'"' -f4)
+                local extra_raw=$(echo "$config" | grep -o '"extra":"[^"]*"' | cut -d'"' -f4)
                 
                 [ -z "$ip_type" ] && continue
                 
@@ -1765,23 +1766,50 @@ restore_forwards() {
                     *) continue ;;
                 esac
                 
-                # 使用统一的函数创建服务（旧格式默认tcp+udp）
-                create_single_socat_service "tcp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
-                create_single_socat_service "udp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
+                # 解析协议列表
+                local restore_protocols=()
+                if [[ -n "$protocols_raw" ]]; then
+                    restore_protocols=($(echo "$protocols_raw" | tr -d '[]"' | tr ',' ' '))
+                else
+                    restore_protocols=("tcp" "udp")
+                fi
                 
-                # 统一的显示信息
+                # SSL协议需要证书
+                if [[ " ${restore_protocols[*]} " =~ " openssl " ]]; then
+                    generate_ssl_cert
+                fi
+                
+                # 创建各协议服务
+                for proto in "${restore_protocols[@]}"; do
+                    create_single_socat_service "$proto" "$ip_version" "$listen_port" "$remote_ip" "$remote_port" "$extra_raw"
+                done
+                
+                # 协议显示
+                local proto_display=""
+                for proto in "${restore_protocols[@]}"; do
+                    [[ -n "$proto_display" ]] && proto_display+="/"
+                    proto_display+=$(echo "$proto" | tr 'a-z' 'A-Z')
+                done
+                
                 case "$ip_type" in
                     "ipv6"|"domain6")
-                        echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port} [${proto_display}]"
                         ;;
                     *)
-                        echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port} [${proto_display}]"
                         ;;
                 esac
                 
-                # 域名监控恢复信息
+                if [[ -n "$extra_raw" && "$extra_raw" != "null" ]]; then
+                    [[ "$extra_raw" == /* ]] && echo "  UNIX套接字: $extra_raw"
+                    [[ "$extra_raw" == *:* ]] && echo "  代理: $extra_raw"
+                fi
+                
                 if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-                    echo "已恢复域名 ${remote_ip} 的IP监控服务"
+                    if [[ " ${restore_protocols[*]} " =~ " tcp " ]] || [[ " ${restore_protocols[*]} " =~ " openssl " ]]; then
+                        setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+                        echo "已恢复域名 ${remote_ip} 的IP监控服务"
+                    fi
                 fi
             done
         fi
