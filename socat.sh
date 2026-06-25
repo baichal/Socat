@@ -468,14 +468,30 @@ add_to_config() {
         4) forward_type="domain6" ;;
     esac
     
+    # 构建protocols JSON数组
+    local protocols_json="["
+    local first_proto=true
+    for proto in "${forward_protocols[@]}"; do
+        if $first_proto; then
+            protocols_json+="\"$proto\""
+            first_proto=false
+        else
+            protocols_json+=",\"$proto\""
+        fi
+    done
+    protocols_json+="]"
+    
+    # 转义extra_config中的特殊字符
+    local extra_escaped=$(echo "$extra_config" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    
     # 使用统一格式处理函数添加配置
-    local new_entry='{"type":"'$forward_type'","listen_port":'$port1',"remote_ip":"'$socatip'","remote_port":'$port2'}'
+    local new_entry='{"type":"'$forward_type'","listen_port":'$port1',"remote_ip":"'$socatip'","remote_port":'$port2',"protocols":'$protocols_json',"extra":"'$extra_escaped'"}'
     
     if command -v jq >/dev/null 2>&1; then
         jq ". += [$new_entry]" "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
     else
-        # 回退到简单的JSON数组追加 - 修复JSON格式问题
-        local new_entry='{"type":"'$forward_type'","listen_port":'$port1',"remote_ip":"'$socatip'","remote_port":'$port2'}'
+        # 回退到简单的JSON数组追加
+        local new_entry='{"type":"'$forward_type'","listen_port":'$port1',"remote_ip":"'$socatip'","remote_port":'$port2',"protocols":'$protocols_json',"extra":"'$extra_escaped'"}'
         
         # 确保配置文件存在且为有效的JSON格式
         if [ ! -s "$CONFIG_FILE" ]; then
@@ -759,55 +775,193 @@ config_socat(){
         fi
     fi
 
-    echo -e "${Green}请输入Socat配置信息！${Font}"
+    # 选择转发协议
+    echo
+    echo -e "${Green}请选择转发协议：${Font}"
+    echo "1. TCP + UDP（默认）"
+    echo "2. 仅 TCP"
+    echo "3. 仅 UDP"
+    echo "4. SCTP（流控制传输协议）"
+    echo "5. SSL/TLS 加密转发"
+    echo "6. UNIX 域套接字"
+    echo "7. SOCKS4A 代理转发"
+    echo "8. HTTP PROXY 代理转发"
     while true; do
-        read -p "请输入本地端口 (留空随机分配): " port1
-        if [[ -z "$port1" ]]; then
-            echo -e "${Yellow}正在为您分配随机端口...${Font}"
-            port1=$(get_random_unused_port)
-            if [[ -n "$port1" ]]; then
-                echo -e "${Green}已分配随机端口: $port1${Font}"
-                break
-            else
-                continue
-            fi
-        elif [[ "$port1" =~ ^[0-9]+$ ]] && [[ $port1 -ge 1 ]] && [[ $port1 -le 65535 ]]; then
-            if check_port $port1; then
-                break
-            fi
-        else
-            echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
-        fi
-    done
-    while true; do
-        read -p "请输入远程端口: " port2
-        if [[ -z "$port2" ]]; then
-            echo -e "${Red}错误: 远程端口不能为空${Font}"
-            continue
-        elif [[ "$port2" =~ ^[0-9]+$ ]] && [[ $port2 -ge 1 ]] && [[ $port2 -le 65535 ]]; then
-            break
-        else
-            echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
-        fi
+        read -p "请输入选项 [1-8] (默认1): " proto_choice
+        proto_choice=${proto_choice:-1}
+        case "$proto_choice" in
+            1|2|3|4|5|6|7|8) break ;;
+            *) echo -e "${Red}无效选项，请重新选择${Font}" ;;
+        esac
     done
     
-    if [ "$ip_version" == "3" ] || [ "$ip_version" == "4" ]; then
+    # 初始化协议列表和额外参数
+    forward_protocols=()
+    extra_config=""
+    
+    case "$proto_choice" in
+        1)
+            forward_protocols=("tcp" "udp")
+            ;;
+        2)
+            forward_protocols=("tcp")
+            ;;
+        3)
+            forward_protocols=("udp")
+            ;;
+        4)
+            forward_protocols=("sctp")
+            ;;
+        5)
+            forward_protocols=("openssl")
+            generate_ssl_cert
+            ;;
+        6)
+            forward_protocols=("unix")
+            echo
+            echo -e "${Green}请选择UNIX套接字方向：${Font}"
+            echo "1. TCP端口 -> UNIX套接字（连接已有UNIX socket）"
+            echo "2. UNIX套接字 -> TCP端口（创建UNIX socket监听）"
+            while true; do
+                read -p "请输入选项 [1-2] (默认1): " unix_dir
+                unix_dir=${unix_dir:-1}
+                case "$unix_dir" in
+                    1|2) break ;;
+                    *) echo -e "${Red}无效选项${Font}" ;;
+                esac
+            done
+            while true; do
+                read -p "请输入UNIX套接字路径: " unix_path
+                if [[ -n "$unix_path" && "$unix_path" == /* ]]; then
+                    extra_config="$unix_path"
+                    if [ "$unix_dir" == "1" ]; then
+                        # TCP -> UNIX，target_ip标记为unix_listen
+                        socatip="unix_listen"
+                    else
+                        # UNIX -> TCP，socatip存路径，target_ip设为特殊标记
+                        socatip="unix_connect"
+                    fi
+                    break
+                else
+                    echo -e "${Red}请输入有效的绝对路径${Font}"
+                fi
+            done
+            ;;
+        7)
+            forward_protocols=("socks")
+            while true; do
+                read -p "请输入SOCKS代理地址:端口 (如 127.0.0.1:1080): " socks_addr
+                if [[ "$socks_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+                    extra_config="$socks_addr"
+                    break
+                else
+                    echo -e "${Red}格式错误，请使用 地址:端口 格式${Font}"
+                fi
+            done
+            ;;
+        8)
+            forward_protocols=("proxy")
+            while true; do
+                read -p "请输入HTTP代理地址:端口 (如 127.0.0.1:8080): " proxy_addr
+                if [[ "$proxy_addr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+$ ]]; then
+                    extra_config="$proxy_addr"
+                    break
+                else
+                    echo -e "${Red}格式错误，请使用 地址:端口 格式${Font}"
+                fi
+            done
+            ;;
+    esac
+
+    echo
+    echo -e "${Green}请输入Socat配置信息！${Font}"
+    
+    # UNIX套接字模式跳过部分输入
+    if [ "$proto_choice" != "6" ]; then
         while true; do
-            read -p "请输入远程域名: " socatip
-            if validate_domain_name "$socatip"; then
-                break
+            read -p "请输入本地端口 (留空随机分配): " port1
+            if [[ -z "$port1" ]]; then
+                echo -e "${Yellow}正在为您分配随机端口...${Font}"
+                port1=$(get_random_unused_port)
+                if [[ -n "$port1" ]]; then
+                    echo -e "${Green}已分配随机端口: $port1${Font}"
+                    break
+                else
+                    continue
+                fi
+            elif [[ "$port1" =~ ^[0-9]+$ ]] && [[ $port1 -ge 1 ]] && [[ $port1 -le 65535 ]]; then
+                if check_port $port1; then
+                    break
+                fi
+            else
+                echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
             fi
         done
     else
-        while true; do
-            read -p "请输入远程IP: " socatip
-            if validate_ip_address "$socatip" "$ip_version"; then
-                if [ "$ip_version" == "2" ]; then
-                    socatip=$(normalize_ipv6 "$socatip")
+        # UNIX模式的端口处理
+        if [ "$unix_dir" == "1" ]; then
+            # TCP -> UNIX：需要本地端口
+            while true; do
+                read -p "请输入本地监听端口 (留空随机分配): " port1
+                if [[ -z "$port1" ]]; then
+                    port1=$(get_random_unused_port)
+                    echo -e "${Green}已分配随机端口: $port1${Font}"
+                    break
+                elif [[ "$port1" =~ ^[0-9]+$ ]] && [[ $port1 -ge 1 ]] && [[ $port1 -le 65535 ]]; then
+                    if check_port $port1; then
+                        break
+                    fi
+                else
+                    echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
                 fi
+            done
+            port2=0  # 远程端口用0占位
+        else
+            # UNIX -> TCP：需要目标端口
+            port1=0  # 本地端口用0占位（UNIX socket路径作标识）
+            while true; do
+                read -p "请输入目标TCP端口 (127.0.0.1): " port2
+                if [[ "$port2" =~ ^[0-9]+$ ]] && [[ $port2 -ge 1 ]] && [[ $port2 -le 65535 ]]; then
+                    break
+                else
+                    echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
+                fi
+            done
+        fi
+    fi
+    
+    # 非UNIX模式下，输入远程端口和地址
+    if [ "$proto_choice" != "6" ]; then
+        while true; do
+            read -p "请输入远程端口: " port2
+            if [[ -z "$port2" ]]; then
+                echo -e "${Red}错误: 远程端口不能为空${Font}"
+                continue
+            elif [[ "$port2" =~ ^[0-9]+$ ]] && [[ $port2 -ge 1 ]] && [[ $port2 -le 65535 ]]; then
                 break
+            else
+                echo -e "${Red}错误: 请输入1-65535之间的有效端口号${Font}"
             fi
         done
+        
+        if [ "$ip_version" == "3" ] || [ "$ip_version" == "4" ]; then
+            while true; do
+                read -p "请输入远程域名: " socatip
+                if validate_domain_name "$socatip"; then
+                    break
+                fi
+            done
+        else
+            while true; do
+                read -p "请输入远程IP: " socatip
+                if validate_ip_address "$socatip" "$ip_version"; then
+                    if [ "$ip_version" == "2" ]; then
+                        socatip=$(normalize_ipv6 "$socatip")
+                    fi
+                    break
+                fi
+            done
+        fi
     fi
 }
 
@@ -904,43 +1058,127 @@ EOF
     systemctl start ${name}.service
 }
 
+# 生成SSL自签名证书
+generate_ssl_cert() {
+    local ssl_dir="$SOCATS_DIR/ssl"
+    local cert_file="$ssl_dir/server.crt"
+    local key_file="$ssl_dir/server.key"
+    
+    if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+        return 0
+    fi
+    
+    mkdir -p "$ssl_dir"
+    
+    if ! command -v openssl >/dev/null 2>&1; then
+        echo -e "${Yellow}未检测到openssl，正在安装...${Font}"
+        case "$PKG_MANAGER" in
+            apt) apt-get install -y openssl >/dev/null 2>&1 ;;
+            yum) yum install -y openssl >/dev/null 2>&1 ;;
+            dnf) dnf install -y openssl >/dev/null 2>&1 ;;
+            pacman) pacman -S --noconfirm openssl >/dev/null 2>&1 ;;
+        esac
+    fi
+    
+    openssl req -x509 -newkey rsa:2048 -keyout "$key_file" -out "$cert_file" \
+        -days 3650 -nodes -subj "/CN=socat-forward" >/dev/null 2>&1
+    
+    if [ -f "$cert_file" ] && [ -f "$key_file" ]; then
+        echo -e "${Green}SSL证书生成成功${Font}"
+        return 0
+    else
+        echo -e "${Red}SSL证书生成失败${Font}"
+        return 1
+    fi
+}
+
 # 创建单个Socat服务
 create_single_socat_service() {
-    local protocol=$1  # tcp/udp
+    local protocol=$1  # tcp/udp/sctp/openssl/unix/socks/proxy
     local ip_version=$2  # 4/6/domain/domain6
     local listen_port=$3
     local target_ip=$4
     local target_port=$5
-    local service_suffix=$6  # 用于服务名
+    local extra=$6  # 额外参数：UNIX socket路径/代理地址等
     
     local service_name="socat-${listen_port}-${target_port}-${protocol}"
     local socat_cmd=""
     
-    # TCP 通用选项：keepalive、地址复用、多进程、缓冲区优化
+    # TCP 通用选项
     local tcp_common_opts="reuseaddr,fork,so-keepalive,so-sndbuf=1048576,so-rcvbuf=1048576"
     
-    # 根据IP版本和协议构建socat命令
-    if [ "$ip_version" == "4" ]; then
-        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} TCP4:${target_ip}:${target_port},connect-timeout=10"
-        if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP4:${target_ip}:${target_port}"
-        fi
-    elif [ "$ip_version" == "6" ]; then
-        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},${tcp_common_opts} TCP6:${target_ip}:${target_port},connect-timeout=10"
-        if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP6:${target_ip}:${target_port}"
-        fi
-    elif [ "$ip_version" == "domain" ]; then
-        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} TCP:${target_ip}:${target_port},connect-timeout=10"
-        if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP:${target_ip}:${target_port}"
-        fi
-    elif [ "$ip_version" == "domain6" ]; then
-        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},${tcp_common_opts} TCP6:${target_ip}:${target_port},connect-timeout=10"
-        if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP6:${target_ip}:${target_port}"
-        fi
-    fi
+    # SSL证书路径
+    local ssl_cert="$SOCATS_DIR/ssl/server.crt"
+    local ssl_key="$SOCATS_DIR/ssl/server.key"
+    
+    # 根据协议和IP版本构建socat命令
+    case "$protocol" in
+        tcp)
+            if [ "$ip_version" == "4" ]; then
+                socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} TCP4:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "6" ]; then
+                socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},${tcp_common_opts} TCP6:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "domain" ]; then
+                socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} TCP:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "domain6" ]; then
+                socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},${tcp_common_opts} TCP6:${target_ip}:${target_port},connect-timeout=10"
+            fi
+            ;;
+        udp)
+            if [ "$ip_version" == "4" ]; then
+                socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP4:${target_ip}:${target_port}"
+            elif [ "$ip_version" == "6" ]; then
+                socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP6:${target_ip}:${target_port}"
+            elif [ "$ip_version" == "domain" ]; then
+                socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP:${target_ip}:${target_port}"
+            elif [ "$ip_version" == "domain6" ]; then
+                socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP6:${target_ip}:${target_port}"
+            fi
+            ;;
+        sctp)
+            if [ "$ip_version" == "4" ]; then
+                socat_cmd="/usr/bin/socat SCTP4-LISTEN:${listen_port},reuseaddr,fork SCTP4:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "6" ]; then
+                socat_cmd="/usr/bin/socat SCTP6-LISTEN:${listen_port},reuseaddr,fork SCTP6:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "domain" ]; then
+                socat_cmd="/usr/bin/socat SCTP4-LISTEN:${listen_port},reuseaddr,fork SCTP:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "domain6" ]; then
+                socat_cmd="/usr/bin/socat SCTP6-LISTEN:${listen_port},reuseaddr,fork SCTP6:${target_ip}:${target_port},connect-timeout=10"
+            fi
+            ;;
+        openssl)
+            if [ "$ip_version" == "4" ]; then
+                socat_cmd="/usr/bin/socat OPENSSL-LISTEN:${listen_port},reuseaddr,fork,cert=${ssl_cert},key=${ssl_key},verify=0 TCP4:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "6" ]; then
+                socat_cmd="/usr/bin/socat OPENSSL-LISTEN:${listen_port},reuseaddr,fork,cert=${ssl_cert},key=${ssl_key},verify=0,pf=ip6 TCP6:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "domain" ]; then
+                socat_cmd="/usr/bin/socat OPENSSL-LISTEN:${listen_port},reuseaddr,fork,cert=${ssl_cert},key=${ssl_key},verify=0 TCP:${target_ip}:${target_port},connect-timeout=10"
+            elif [ "$ip_version" == "domain6" ]; then
+                socat_cmd="/usr/bin/socat OPENSSL-LISTEN:${listen_port},reuseaddr,fork,cert=${ssl_cert},key=${ssl_key},verify=0,pf=ip6 TCP6:${target_ip}:${target_port},connect-timeout=10"
+            fi
+            ;;
+        unix)
+            if [ "$target_ip" == "unix_listen" ]; then
+                socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} UNIX-CONNECT:${extra}"
+            else
+                socat_cmd="/usr/bin/socat UNIX-LISTEN:${extra},reuseaddr,fork,unlink-early TCP4:127.0.0.1:${target_port},connect-timeout=10"
+            fi
+            ;;
+        socks)
+            local socks_host="${extra%%:*}"
+            local socks_port="${extra##*:}"
+            socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} SOCKS4A:${socks_host}:${target_ip}:${target_port},socksport=${socks_port}"
+            ;;
+        proxy)
+            local proxy_host="${extra%%:*}"
+            local proxy_port="${extra##*:}"
+            socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} PROXY:${proxy_host}:${target_ip}:${target_port},proxyport=${proxy_port}"
+            ;;
+        *)
+            echo -e "${Red}不支持的协议: $protocol${Font}"
+            return 1
+            ;;
+    esac
     
     create_systemd_service "$service_name" "$socat_cmd"
 }
@@ -976,24 +1214,66 @@ start_socat(){
             ;;
     esac
     
-    # 统一创建TCP和UDP服务
-    create_single_socat_service "tcp" "$ip_type_num" "$port1" "$socatip" "$port2"
-    create_single_socat_service "udp" "$ip_type_num" "$port1" "$socatip" "$port2"
+    # 根据 forward_protocols 数组创建对应协议的服务
+    local service_names=()
+    for proto in "${forward_protocols[@]}"; do
+        create_single_socat_service "$proto" "$ip_type_num" "$port1" "$socatip" "$port2" "$extra_config"
+        if [ "$proto" == "unix" ]; then
+            if [ "$socatip" == "unix_listen" ]; then
+                service_names+=("socat-${port1}-${port2}-${proto}")
+            else
+                # UNIX -> TCP 模式用路径哈希作标识
+                local path_hash=$(echo -n "$extra_config" | md5sum | cut -c1-8)
+                service_names+=("socat-${port1}-${port2}-${proto}")
+            fi
+        else
+            service_names+=("socat-${port1}-${port2}-${proto}")
+        fi
+    done
     
-    # 如果是域名类型，设置监控
+    # 如果是域名类型，设置监控（仅TCP类协议有效）
     if [ "$ip_version" == "3" ] || [ "$ip_version" == "4" ]; then
-        setup_domain_monitor "$socatip" "$port1" "$ip_type_num" "$port2"
+        if [[ " ${forward_protocols[*]} " =~ " tcp " ]] || [[ " ${forward_protocols[*]} " =~ " openssl " ]]; then
+            setup_domain_monitor "$socatip" "$port1" "$ip_type_num" "$port2"
+        fi
     fi
 
     sleep 2
-    local service_name_tcp="socat-${port1}-${port2}-tcp"
-    local service_name_udp="socat-${port1}-${port2}-udp"
     
-    if systemctl is-active --quiet "$service_name_tcp" && systemctl is-active --quiet "$service_name_udp"; then
+    # 检查所有服务是否正常运行
+    local all_running=true
+    local failed_services=()
+    for svc in "${service_names[@]}"; do
+        if ! systemctl is-active --quiet "$svc"; then
+            all_running=false
+            failed_services+=("$svc")
+        fi
+    done
+    
+    if $all_running; then
         echo -e "${Green}Socat配置成功!${Font}"
-        echo -e "${Blue}本地端口: ${port1}${Font}"
-        echo -e "${Blue}远程端口: ${port2}${Font}"
-        echo -e "${Blue}远程地址: ${socatip}${Font}"
+        
+        # 显示协议信息
+        echo -e "${Blue}协议: ${forward_protocols[*]}${Font}"
+        
+        # UNIX模式特殊显示
+        if [[ " ${forward_protocols[*]} " =~ " unix " ]]; then
+            echo -e "${Blue}UNIX套接字路径: ${extra_config}${Font}"
+            if [ "$socatip" == "unix_listen" ]; then
+                echo -e "${Blue}方向: TCP端口 ${port1} -> UNIX套接字${Font}"
+            else
+                echo -e "${Blue}方向: UNIX套接字 -> 127.0.0.1:${port2}${Font}"
+            fi
+        else
+            echo -e "${Blue}本地端口: ${port1}${Font}"
+            echo -e "${Blue}远程端口: ${port2}${Font}"
+            echo -e "${Blue}远程地址: ${socatip}${Font}"
+        fi
+        
+        # 代理模式额外显示
+        if [[ " ${forward_protocols[*]} " =~ " socks " ]] || [[ " ${forward_protocols[*]} " =~ " proxy " ]]; then
+            echo -e "${Blue}代理地址: ${extra_config}${Font}"
+        fi
         
         # 统一的显示信息
         local local_addr="$ip"
@@ -1024,7 +1304,11 @@ start_socat(){
         return 0
     else
         echo -e "${Red}Socat启动失败，请检查系统日志。${Font}"
-        journalctl -u "$service_name_tcp" -u "$service_name_udp"
+        echo -e "${Red}失败的服务: ${failed_services[*]}${Font}"
+        for svc in "${failed_services[@]}"; do
+            journalctl -u "$svc" --no-pager -n 20
+            echo "---"
+        done
         return 1
     fi
 }
@@ -1058,23 +1342,36 @@ view_delete_forward() {
             local listen_port=$(echo "$config" | jq -r '.listen_port')
             local remote_ip=$(echo "$config" | jq -r '.remote_ip')
             local remote_port=$(echo "$config" | jq -r '.remote_port')
+            local protocols_raw=$(echo "$config" | jq -r '.protocols // empty')
+            local extra_raw=$(echo "$config" | jq -r '.extra // empty')
             
-            entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            # 兼容旧配置：没有protocols字段时默认tcp+udp
+            local proto_display="TCP/UDP"
+            if [[ -n "$protocols_raw" && "$protocols_raw" != "null" ]]; then
+                proto_display=$(echo "$protocols_raw" | tr -d '[]"' | sed 's/,/ \/ /g' | tr 'a-z' 'A-Z')
+            fi
+            
+            entries+=("$ip_type $listen_port $remote_ip $remote_port $protocols_raw $extra_raw")
             local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
-                    echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
+                    echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port ($proto_display)"
                     ;;
                 "ipv6")
-                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port ($proto_display)"
                     ;;
                 "domain")
-                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
+                    echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port ($proto_display) [DDNS, IPv4]"
                     ;;
                 "domain6")
-                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port ($proto_display) [DDNS, IPv6]"
                     ;;
             esac
+            # 显示extra信息（如果有）
+            if [[ -n "$extra_raw" && "$extra_raw" != "null" && -n "$extra_raw" ]]; then
+                [[ "$extra_raw" == /* ]] && echo "   UNIX套接字: $extra_raw"
+                [[ "$extra_raw" == *:* ]] && echo "   代理: $extra_raw"
+            fi
             ((i++))
         done <<< "$configs"
     else
@@ -1117,8 +1414,21 @@ view_delete_forward() {
         for num in "${nums_to_delete[@]}"; do
             if [ $num -ge 1 ] && [ $num -lt $i ]; then
                 local index=$((num-1))
-                IFS=' ' read -r ip_type listen_port remote_ip remote_port <<< "${entries[$index]}"
-                remove_forward "$listen_port" "$ip_type"
+                local entry_str="${entries[$index]}"
+                local ip_type=$(echo "$entry_str" | awk '{print $1}')
+                local listen_port=$(echo "$entry_str" | awk '{print $2}')
+                local remote_ip=$(echo "$entry_str" | awk '{print $3}')
+                local remote_port=$(echo "$entry_str" | awk '{print $4}')
+                local protocols_raw=$(echo "$entry_str" | awk '{print $5}')
+                local extra_raw=$(echo "$entry_str" | awk '{print $6}')
+                
+                # 解析协议列表用于显示
+                local proto_display="TCP/UDP"
+                if [[ -n "$protocols_raw" && "$protocols_raw" != "null" ]]; then
+                    proto_display=$(echo "$protocols_raw" | tr -d '[]"' | sed 's/,/ \/ /g' | tr 'a-z' 'A-Z')
+                fi
+                
+                remove_forward "$listen_port" "$ip_type" "$protocols_raw"
                 
                 # 从JSON配置中删除
                 if command -v jq >/dev/null 2>&1; then
@@ -1133,16 +1443,16 @@ view_delete_forward() {
                 local local_ipv6="${ipv6:-未检测到}"
                 case "$ip_type" in
                     "ipv4")
-                        echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
+                        echo -e "${Green}已删除IPv4转发: $ip:$listen_port ($proto_display)${Font}"
                         ;;
                     "ipv6")
-                        echo -e "${Green}已删除IPv6转发: [$local_ipv6]:$listen_port (TCP/UDP)${Font}"
+                        echo -e "${Green}已删除IPv6转发: [$local_ipv6]:$listen_port ($proto_display)${Font}"
                         ;;
                     "domain")
-                        echo -e "${Green}已删除IPv4 域名转发: $ip:$listen_port --> $remote_ip (TCP/UDP) [IPv4]${Font}"
+                        echo -e "${Green}已删除IPv4 域名转发: $ip:$listen_port --> $remote_ip ($proto_display) [IPv4]${Font}"
                         ;;
                     "domain6")
-                        echo -e "${Green}已删除IPv6 域名转发: [$local_ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
+                        echo -e "${Green}已删除IPv6 域名转发: [$local_ipv6]:$listen_port --> $remote_ip ($proto_display) [IPv6]${Font}"
                         ;;
                 esac
                 remove_firewall_rules "$listen_port" "$ip_type"
@@ -1157,11 +1467,12 @@ view_delete_forward() {
 remove_forward() {
     local listen_port=$1
     local ip_type=$2
+    local protocols_raw=$3
     local service_name="socat-${listen_port}-*"
     
     # 停止并移除socat服务
-    systemctl stop ${service_name}
-    systemctl disable ${service_name}
+    systemctl stop ${service_name} 2>/dev/null
+    systemctl disable ${service_name} 2>/dev/null
     rm -f /etc/systemd/system/${service_name}.service
     systemctl daemon-reload
     
@@ -1331,6 +1642,16 @@ restore_forwards() {
                 local listen_port=$(echo "$config" | jq -r '.listen_port')
                 local remote_ip=$(echo "$config" | jq -r '.remote_ip')
                 local remote_port=$(echo "$config" | jq -r '.remote_port')
+                local protocols_raw=$(echo "$config" | jq -r '.protocols // empty')
+                local extra_raw=$(echo "$config" | jq -r '.extra // empty')
+                
+                # 兼容旧配置：没有protocols字段时默认tcp+udp
+                local restore_protocols=()
+                if [[ -z "$protocols_raw" || "$protocols_raw" == "null" ]]; then
+                    restore_protocols=("tcp" "udp")
+                else
+                    restore_protocols=($(echo "$protocols_raw" | tr -d '[]"' | tr ',' ' '))
+                fi
                 
                 # 将配置类型转换为内部格式
                 local ip_version=""
@@ -1342,24 +1663,45 @@ restore_forwards() {
                     *) continue ;;  # 跳过无效类型
                 esac
                 
+                # SSL协议需要先确保证书存在
+                if [[ " ${restore_protocols[*]} " =~ " openssl " ]]; then
+                    generate_ssl_cert
+                fi
+                
                 # 使用统一的函数创建服务
-                create_single_socat_service "tcp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
-                create_single_socat_service "udp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
+                for proto in "${restore_protocols[@]}"; do
+                    create_single_socat_service "$proto" "$ip_version" "$listen_port" "$remote_ip" "$remote_port" "$extra_raw"
+                done
                 
                 # 如果是域名类型，恢复监控
                 if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-                    setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+                    if [[ " ${restore_protocols[*]} " =~ " tcp " ]] || [[ " ${restore_protocols[*]} " =~ " openssl " ]]; then
+                        setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
+                    fi
                 fi
+                
+                # 协议显示
+                local proto_display=""
+                for proto in "${restore_protocols[@]}"; do
+                    [[ -n "$proto_display" ]] && proto_display+="/"
+                    proto_display+=$(echo "$proto" | tr 'a-z' 'A-Z')
+                done
                 
                 # 统一的显示信息
                 case "$ip_type" in
                     "ipv6"|"domain6")
-                        echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        echo "已恢复IPv6转发：${listen_port} -> ${remote_ip}:${remote_port} [${proto_display}]"
                         ;;
                     *)
-                        echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port}"
+                        echo "已恢复IPv4转发：${listen_port} -> ${remote_ip}:${remote_port} [${proto_display}]"
                         ;;
                 esac
+                
+                # 显示extra信息
+                if [[ -n "$extra_raw" && "$extra_raw" != "null" ]]; then
+                    [[ "$extra_raw" == /* ]] && echo "  UNIX套接字: $extra_raw"
+                    [[ "$extra_raw" == *:* ]] && echo "  代理: $extra_raw"
+                fi
                 
                 # 域名监控恢复信息
                 if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
@@ -1390,14 +1732,9 @@ restore_forwards() {
                     *) continue ;;
                 esac
                 
-                # 使用统一的函数创建服务
+                # 使用统一的函数创建服务（旧格式默认tcp+udp）
                 create_single_socat_service "tcp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
                 create_single_socat_service "udp" "$ip_version" "$listen_port" "$remote_ip" "$remote_port"
-                
-                # 如果是域名类型，恢复监控
-                if [ "$ip_type" == "domain" ] || [ "$ip_type" == "domain6" ]; then
-                    setup_domain_monitor "$remote_ip" "$listen_port" "$ip_type" "$remote_port"
-                fi
                 
                 # 统一的显示信息
                 case "$ip_type" in
