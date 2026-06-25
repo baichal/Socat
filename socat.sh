@@ -499,8 +499,7 @@ add_to_config() {
         if [[ "$content" == "[]" ]]; then
             echo "[$new_entry]" > "$CONFIG_FILE"
             rm -f "$temp_file"
-        # 确保格式正确
-        fix_json_format
+            fix_json_format
             return
         fi
         
@@ -876,16 +875,26 @@ get_random_unused_port() {
 create_systemd_service() {
     local name=$1
     local command=$2
+    
+    # 检查服务是否已存在且正在运行，若运行则先停止
+    if systemctl is-active --quiet "$name" 2>/dev/null; then
+        systemctl stop "$name" 2>/dev/null
+    fi
+    
     cat > /etc/systemd/system/${name}.service <<EOF
 [Unit]
 Description=Socat Forwarding Service
-After=network.target
+After=network.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
 ExecStart=$command
-Restart=always
-RestartSec=3
+Restart=on-failure
+RestartSec=5
+StartLimitInterval=60
+StartLimitBurst=5
+LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
@@ -898,7 +907,7 @@ EOF
 # 创建单个Socat服务
 create_single_socat_service() {
     local protocol=$1  # tcp/udp
-    local ip_version=$2  # 4/6
+    local ip_version=$2  # 4/6/domain/domain6
     local listen_port=$3
     local target_ip=$4
     local target_port=$5
@@ -907,26 +916,29 @@ create_single_socat_service() {
     local service_name="socat-${listen_port}-${target_port}-${protocol}"
     local socat_cmd=""
     
+    # TCP 通用选项：keepalive、地址复用、多进程、缓冲区优化
+    local tcp_common_opts="reuseaddr,fork,so-keepalive,so-sndbuf=1048576,so-rcvbuf=1048576"
+    
     # 根据IP版本和协议构建socat命令
     if [ "$ip_version" == "4" ]; then
-        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP4:${target_ip}:${target_port}"
+        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} TCP4:${target_ip}:${target_port},connect-timeout=10"
         if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP4:${target_ip}:${target_port}"
+            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP4:${target_ip}:${target_port}"
         fi
     elif [ "$ip_version" == "6" ]; then
-        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${target_ip}:${target_port}"
+        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},${tcp_common_opts} TCP6:${target_ip}:${target_port},connect-timeout=10"
         if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${target_ip}:${target_port}"
+            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP6:${target_ip}:${target_port}"
         fi
     elif [ "$ip_version" == "domain" ]; then
-        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},reuseaddr,fork TCP:${target_ip}:${target_port}"
+        socat_cmd="/usr/bin/socat TCP4-LISTEN:${listen_port},${tcp_common_opts} TCP:${target_ip}:${target_port},connect-timeout=10"
         if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork UDP:${target_ip}:${target_port}"
+            socat_cmd="/usr/bin/socat UDP4-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP:${target_ip}:${target_port}"
         fi
     elif [ "$ip_version" == "domain6" ]; then
-        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},reuseaddr,fork TCP6:${target_ip}:${target_port}"
+        socat_cmd="/usr/bin/socat TCP6-LISTEN:${listen_port},${tcp_common_opts} TCP6:${target_ip}:${target_port},connect-timeout=10"
         if [ "$protocol" == "udp" ]; then
-            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork UDP6:${target_ip}:${target_port}"
+            socat_cmd="/usr/bin/socat UDP6-LISTEN:${listen_port},reuseaddr,fork,so-sndbuf=1048576,so-rcvbuf=1048576 UDP6:${target_ip}:${target_port}"
         fi
     fi
     
@@ -984,13 +996,15 @@ start_socat(){
         echo -e "${Blue}远程地址: ${socatip}${Font}"
         
         # 统一的显示信息
+        local local_addr="$ip"
+        [[ "$ip_version" == "2" ]] && [[ -n "$ipv6" ]] && local_addr="$ipv6"
         case "$ip_version" in
             1)
                 echo -e "${Blue}本地服务器IP: ${ip}${Font}"
                 echo -e "${Blue}IP版本: IPv4${Font}"
                 ;;
             2)
-                echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+                echo -e "${Blue}本地服务器IPv6: ${ipv6:-未检测到}${Font}"
                 echo -e "${Blue}IP版本: IPv6${Font}"
                 ;;
             3)
@@ -999,7 +1013,7 @@ start_socat(){
                 echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
                 ;;
             4)
-                echo -e "${Blue}本地服务器IPv6: ${ipv6}${Font}"
+                echo -e "${Blue}本地服务器IPv6: ${ipv6:-未检测到}${Font}"
                 echo -e "${Blue}地址类型: 域名 (DDNS, IPv6优先)${Font}"
                 echo -e "${Blue}域名监控: 已启用 (每5分钟自动检查IP变更)${Font}"
                 ;;
@@ -1046,18 +1060,19 @@ view_delete_forward() {
             local remote_port=$(echo "$config" | jq -r '.remote_port')
             
             entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
                     echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
                     ;;
                 "ipv6")
-                    echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
                     ;;
                 "domain")
                     echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
                     ;;
                 "domain6")
-                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
                     ;;
             esac
             ((i++))
@@ -1077,18 +1092,19 @@ view_delete_forward() {
             [ -z "$ip_type" ] && continue
             
             entries+=("$ip_type $listen_port $remote_ip $remote_port")
+            local local_ipv6="${ipv6:-未检测到}"
             case "$ip_type" in
                 "ipv4")
                     echo "$i. IPv4: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP)"
                     ;;
                 "ipv6")
-                    echo "$i. IPv6: [$ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
+                    echo "$i. IPv6: [$local_ipv6]:$listen_port --> [$remote_ip]:$remote_port (TCP/UDP)"
                     ;;
                 "domain")
                     echo "$i. IPv4 域名: $ip:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv4]"
                     ;;
                 "domain6")
-                    echo "$i. IPv6 域名: [$ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
+                    echo "$i. IPv6 域名: [$local_ipv6]:$listen_port --> $remote_ip:$remote_port (TCP/UDP) [DDNS, IPv6]"
                     ;;
             esac
             ((i++))
@@ -1114,18 +1130,19 @@ view_delete_forward() {
                     echo "$new_content" > "$CONFIG_FILE"
                 fi
                 
+                local local_ipv6="${ipv6:-未检测到}"
                 case "$ip_type" in
                     "ipv4")
                         echo -e "${Green}已删除IPv4转发: $ip:$listen_port (TCP/UDP)${Font}"
                         ;;
                     "ipv6")
-                        echo -e "${Green}已删除IPv6转发: [$ipv6]:$listen_port (TCP/UDP)${Font}"
+                        echo -e "${Green}已删除IPv6转发: [$local_ipv6]:$listen_port (TCP/UDP)${Font}"
                         ;;
                     "domain")
                         echo -e "${Green}已删除IPv4 域名转发: $ip:$listen_port --> $remote_ip (TCP/UDP) [IPv4]${Font}"
                         ;;
                     "domain6")
-                        echo -e "${Green}已删除IPv6 域名转发: [$ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
+                        echo -e "${Green}已删除IPv6 域名转发: [$local_ipv6]:$listen_port --> $remote_ip (TCP/UDP) [IPv6]${Font}"
                         ;;
                 esac
                 remove_firewall_rules "$listen_port" "$ip_type"
@@ -1546,83 +1563,11 @@ check_and_enable_bbr() {
 manage_network_acceleration() {
     local action="$1"  # "enable" 或 "disable"
     
-    # 定义加速配置（键=值 格式）- 专为端口转发优化
-    local -A acceleration_configs=(
-        # 核心转发优化
-        ["net.ipv4.tcp_fastopen"]="3"
-        ["net.ipv4.tcp_slow_start_after_idle"]="0"
-        ["net.ipv4.tcp_mtu_probing"]="1"
-        
-        # 缓冲区优化 - 大幅提升转发性能
-        ["net.core.rmem_max"]="67108864"
-        ["net.core.wmem_max"]="67108864"
-        ["net.ipv4.tcp_rmem"]="4096 262144 67108864"
-        ["net.ipv4.tcp_wmem"]="4096 262144 67108864"
-        ["net.ipv4.tcp_mem"]="8388608 12582912 16777216"
-        ["net.core.netdev_max_backlog"]="8192"
-        ["net.core.netdev_budget"]="600"
-        
-        # 连接管理优化
-        ["net.ipv4.tcp_max_syn_backlog"]="8192"
-        ["net.ipv4.tcp_tw_reuse"]="1"
-        ["net.ipv4.tcp_fin_timeout"]="10"
-        ["net.ipv4.tcp_keepalive_time"]="600"
-        ["net.ipv4.tcp_keepalive_intvl"]="30"
-        ["net.ipv4.tcp_keepalive_probes"]="3"
-        ["net.ipv4.tcp_max_tw_buckets"]="5000000"
-        
-        # 高级TCP特性
-        ["net.ipv4.tcp_syncookies"]="1"
-        ["net.ipv4.tcp_sack"]="1"
-        ["net.ipv4.tcp_fack"]="1"
-        ["net.ipv4.tcp_window_scaling"]="1"
-        ["net.ipv4.tcp_adv_win_scale"]="1"
-        ["net.ipv4.tcp_moderate_rcvbuf"]="1"
-        ["net.ipv4.tcp_no_metrics_save"]="1"
-        ["net.ipv4.tcp_rfc1337"]="1"
-        ["net.ipv4.tcp_timestamps"]="1"
-        ["net.ipv4.tcp_ecn"]="0"  # 禁用ECN避免兼容性问题
-        
-        # 性能调优
-        ["net.core.optmem_max"]="65536"
-        ["net.ipv4.tcp_notsent_lowat"]="32768"
-        ["net.ipv4.ip_local_port_range"]="1024 65535"
-        ["net.ipv4.tcp_max_orphans"]="8192"
-        ["net.ipv4.tcp_abort_on_overflow"]="0"
-        ["net.core.somaxconn"]="8192"
-    )
+    # 备份文件路径 - 保存用户原始配置
+    local backup_file="$SOCATS_DIR/sysctl_backup.conf"
     
-    # 定义默认配置（键=值 格式）
-    local -A default_configs=(
-        ["net.ipv4.tcp_fastopen"]="0"
-        ["net.ipv4.tcp_congestion_control"]="cubic"
-        ["net.core.default_qdisc"]="pfifo_fast"
-        ["net.ipv4.tcp_slow_start_after_idle"]="1"
-        ["net.ipv4.tcp_mtu_probing"]="0"
-        ["net.core.rmem_max"]="212992"
-        ["net.core.wmem_max"]="212992"
-        ["net.ipv4.tcp_rmem"]="4096 87380 6291456"
-        ["net.ipv4.tcp_wmem"]="4096 16384 4194304"
-        ["net.ipv4.tcp_mem"]="378651 504868 757299"
-        ["net.core.netdev_max_backlog"]="1000"
-        ["net.ipv4.tcp_max_syn_backlog"]="128"
-        ["net.ipv4.tcp_tw_reuse"]="0"
-        ["net.ipv4.tcp_fin_timeout"]="60"
-        ["net.ipv4.tcp_keepalive_time"]="7200"
-        ["net.ipv4.tcp_max_tw_buckets"]="180000"
-        ["net.ipv4.tcp_syncookies"]="1"
-        ["net.ipv4.tcp_rfc1337"]="0"
-        ["net.ipv4.tcp_sack"]="1"
-        ["net.ipv4.tcp_fack"]="1"
-        ["net.ipv4.tcp_window_scaling"]="1"
-        ["net.ipv4.tcp_adv_win_scale"]="1"
-        ["net.ipv4.tcp_moderate_rcvbuf"]="1"
-        ["net.core.optmem_max"]="20480"
-        ["net.ipv4.tcp_notsent_lowat"]="4294967295"
-    )
-    
-    # 定义所有需要清理的配置键 - 包含新增和原有的所有网络参数
-    local cleanup_keys=(
+    # 定义所有需要管理的配置键
+    local all_keys=(
         "net.ipv4.tcp_fastopen"
         "net.ipv4.tcp_congestion_control"
         "net.core.default_qdisc"
@@ -1660,40 +1605,179 @@ manage_network_acceleration() {
         "net.core.somaxconn"
     )
     
-    # 清理配置文件中的相关配置
-    for key in "${cleanup_keys[@]}"; do
-        sed -i "/${key//\./\\.}/d" /etc/sysctl.conf
-    done
+    # 定义加速配置（键=值 格式）- 专为端口转发优化
+    local -A acceleration_configs=(
+        ["net.ipv4.tcp_fastopen"]="3"
+        ["net.ipv4.tcp_slow_start_after_idle"]="0"
+        ["net.ipv4.tcp_mtu_probing"]="1"
+        ["net.core.rmem_max"]="67108864"
+        ["net.core.wmem_max"]="67108864"
+        ["net.ipv4.tcp_rmem"]="4096 262144 67108864"
+        ["net.ipv4.tcp_wmem"]="4096 262144 67108864"
+        ["net.ipv4.tcp_mem"]="8388608 12582912 16777216"
+        ["net.core.netdev_max_backlog"]="8192"
+        ["net.core.netdev_budget"]="600"
+        ["net.ipv4.tcp_max_syn_backlog"]="8192"
+        ["net.ipv4.tcp_tw_reuse"]="1"
+        ["net.ipv4.tcp_fin_timeout"]="10"
+        ["net.ipv4.tcp_keepalive_time"]="600"
+        ["net.ipv4.tcp_keepalive_intvl"]="30"
+        ["net.ipv4.tcp_keepalive_probes"]="3"
+        ["net.ipv4.tcp_max_tw_buckets"]="5000000"
+        ["net.ipv4.tcp_syncookies"]="1"
+        ["net.ipv4.tcp_sack"]="1"
+        ["net.ipv4.tcp_fack"]="1"
+        ["net.ipv4.tcp_window_scaling"]="1"
+        ["net.ipv4.tcp_adv_win_scale"]="1"
+        ["net.ipv4.tcp_moderate_rcvbuf"]="1"
+        ["net.ipv4.tcp_no_metrics_save"]="1"
+        ["net.ipv4.tcp_rfc1337"]="1"
+        ["net.ipv4.tcp_timestamps"]="1"
+        ["net.ipv4.tcp_ecn"]="0"
+        ["net.core.optmem_max"]="65536"
+        ["net.ipv4.tcp_notsent_lowat"]="32768"
+        ["net.ipv4.ip_local_port_range"]="1024 65535"
+        ["net.ipv4.tcp_max_orphans"]="8192"
+        ["net.ipv4.tcp_abort_on_overflow"]="0"
+        ["net.core.somaxconn"]="8192"
+    )
     
-    # 根据action选择配置
-    local -n configs
-    local message=""
+    # 备份当前系统配置（只在开启加速且没有备份时执行）
+    backup_current_config() {
+        if [ -f "$backup_file" ]; then
+            return 0  # 已有备份，不覆盖
+        fi
+        echo "# Sysctl configuration backup - created $(date '+%Y-%m-%d %H:%M:%S')" > "$backup_file"
+        for key in "${all_keys[@]}"; do
+            local current_val=$(sysctl -n "$key" 2>/dev/null)
+            if [[ -n "$current_val" ]]; then
+                echo "$key = $current_val" >> "$backup_file"
+            fi
+        done
+        return 0
+    }
+    
+    # 从 /etc/sysctl.conf 中清理所有相关配置
+    cleanup_sysctl_conf() {
+        for key in "${all_keys[@]}"; do
+            sed -i "/${key//\./\\.}/d" /etc/sysctl.conf
+        done
+    }
     
     if [[ "$action" == "enable" ]]; then
-        configs=acceleration_configs
-        message="端口转发加速已开启"
+        # 先备份原始配置
+        backup_current_config
         
-        # 额外处理BBR
+        # 清理 sysctl.conf 中旧的相关配置
+        cleanup_sysctl_conf
+        
+        # 启用 BBR
         check_and_enable_bbr
-        echo 3 > /proc/sys/net/ipv4/tcp_fastopen
+        
+        # 应用加速参数
+        local applied=0
+        for key in "${!acceleration_configs[@]}"; do
+            if sysctl -w "${key}=${acceleration_configs[$key]}" >/dev/null 2>&1; then
+                applied=$((applied + 1))
+            fi
+        done
+        
+        # 写入 sysctl.conf 持久化
+        for key in "${!acceleration_configs[@]}"; do
+            echo "$key = ${acceleration_configs[$key]}" >> /etc/sysctl.conf
+        done
+        
+        # 重新加载 sysctl.conf 确保生效
+        sysctl -p >/dev/null 2>&1
+        
+        echo -e "${Green}端口转发加速已开启${Font} (已优化 $applied 项参数)"
+        
     else
-        configs=default_configs
-        message="端口转发加速已关闭"
-    fi
-    
-    # 应用配置（静默执行）
-    for key in "${!configs[@]}"; do
-        sysctl -w "${key}=${configs[$key]}" >/dev/null 2>&1  #删除”/dev/null 2>&1“输出信息
-        echo "${key} = ${configs[$key]}" >> /etc/sysctl.conf
-    done
-    
-    sysctl -p >/dev/null 2>&1 #删除”/dev/null 2>&1“输出信息
-    
-    # 输出结果
-    if [[ "$action" == "enable" ]]; then
-        echo -e "${Green}${message}${Font}"
-    else
-        echo -e "${Yellow}${message}${Font}"
+        # 关闭加速 - 优先从备份恢复
+        local restored_ok=false
+        
+        if [ -f "$backup_file" ]; then
+            echo -e "${Yellow}正在从备份恢复原始网络配置...${Font}"
+            
+            # 清理 sysctl.conf 中相关配置
+            cleanup_sysctl_conf
+            
+            # 应用备份值
+            local restored_count=0
+            while IFS='=' read -r key value; do
+                key=$(echo "$key" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                value=$(echo "$value" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+                [[ -z "$key" || "$key" == \#* ]] && continue
+                sysctl -w "$key=$value" >/dev/null 2>&1 && restored_count=$((restored_count + 1))
+                echo "$key = $value" >> /etc/sysctl.conf
+            done < "$backup_file"
+            
+            sysctl -p >/dev/null 2>&1
+            
+            if [[ $restored_count -gt 0 ]]; then
+                restored_ok=true
+                # 删除备份文件，表示已恢复
+                rm -f "$backup_file"
+                echo -e "${Green}端口转发加速已关闭${Font} (已恢复 $restored_count 项原始配置)"
+            fi
+        fi
+        
+        # 如果备份恢复失败，使用内置默认值作为兜底
+        if [[ "$restored_ok" != true ]]; then
+            echo -e "${Yellow}未找到原始配置备份，使用系统默认值恢复...${Font}"
+            
+            cleanup_sysctl_conf
+            
+            local -A fallback_defaults=(
+                ["net.ipv4.tcp_fastopen"]="0"
+                ["net.ipv4.tcp_congestion_control"]="cubic"
+                ["net.core.default_qdisc"]="pfifo_fast"
+                ["net.ipv4.tcp_slow_start_after_idle"]="1"
+                ["net.ipv4.tcp_mtu_probing"]="0"
+                ["net.core.rmem_max"]="212992"
+                ["net.core.wmem_max"]="212992"
+                ["net.ipv4.tcp_rmem"]="4096 87380 6291456"
+                ["net.ipv4.tcp_wmem"]="4096 16384 4194304"
+                ["net.ipv4.tcp_mem"]="378651 504868 757299"
+                ["net.core.netdev_max_backlog"]="1000"
+                ["net.core.netdev_budget"]="300"
+                ["net.ipv4.tcp_max_syn_backlog"]="128"
+                ["net.ipv4.tcp_tw_reuse"]="0"
+                ["net.ipv4.tcp_fin_timeout"]="60"
+                ["net.ipv4.tcp_keepalive_time"]="7200"
+                ["net.ipv4.tcp_keepalive_intvl"]="75"
+                ["net.ipv4.tcp_keepalive_probes"]="9"
+                ["net.ipv4.tcp_max_tw_buckets"]="180000"
+                ["net.ipv4.tcp_syncookies"]="1"
+                ["net.ipv4.tcp_rfc1337"]="0"
+                ["net.ipv4.tcp_sack"]="1"
+                ["net.ipv4.tcp_fack"]="1"
+                ["net.ipv4.tcp_window_scaling"]="1"
+                ["net.ipv4.tcp_adv_win_scale"]="1"
+                ["net.ipv4.tcp_moderate_rcvbuf"]="1"
+                ["net.ipv4.tcp_no_metrics_save"]="0"
+                ["net.ipv4.tcp_timestamps"]="1"
+                ["net.ipv4.tcp_ecn"]="2"
+                ["net.core.optmem_max"]="20480"
+                ["net.ipv4.tcp_notsent_lowat"]="4294967295"
+                ["net.ipv4.ip_local_port_range"]="32768 60999"
+                ["net.ipv4.tcp_max_orphans"]="8192"
+                ["net.ipv4.tcp_abort_on_overflow"]="0"
+                ["net.core.somaxconn"]="128"
+            )
+            
+            local restored=0
+            for key in "${!fallback_defaults[@]}"; do
+                if sysctl -w "${key}=${fallback_defaults[$key]}" >/dev/null 2>&1; then
+                    restored=$((restored + 1))
+                fi
+                echo "$key = ${fallback_defaults[$key]}" >> /etc/sysctl.conf
+            done
+            
+            sysctl -p >/dev/null 2>&1
+            
+            echo -e "${Yellow}端口转发加速已关闭${Font} (已恢复 $restored 项默认配置)"
+        fi
     fi
 }
 
@@ -1707,6 +1791,84 @@ enable_acceleration() {
 disable_acceleration() {
     echo -e "${Yellow}正在关闭端口转发加速...${Font}"
     manage_network_acceleration "disable"
+}
+
+# 查看端口转发加速状态
+show_acceleration_status() {
+    echo -e "${Green}=== 端口转发加速状态 ===${Font}"
+    echo
+    
+    # 检查BBR状态
+    local current_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "未知")
+    local current_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "未知")
+    local is_bbr=false
+    
+    for variant in bbrplus bbr bbr2; do
+        if [[ "$current_cc" == "$variant" ]]; then
+            is_bbr=true
+            break
+        fi
+    done
+    
+    echo -e "拥塞控制算法: ${Blue}$current_cc${Font} $($is_bbr && echo -e "${Green}[已启用BBR]${Font}" || echo -e "${Yellow}[未启用BBR]${Font}")"
+    echo -e "队列调度算法: ${Blue}$current_qdisc${Font}"
+    echo
+    
+    # 检查关键加速参数
+    echo -e "${Green}关键加速参数:${Font}"
+    
+    local params=(
+        "net.ipv4.tcp_fastopen|TCP快速打开"
+        "net.ipv4.tcp_slow_start_after_idle|空闲后慢启动"
+        "net.core.rmem_max|最大接收缓冲区"
+        "net.core.wmem_max|最大发送缓冲区"
+        "net.ipv4.tcp_tw_reuse|TIME_WAIT重用"
+        "net.ipv4.tcp_fin_timeout|FIN超时时间"
+    )
+    
+    local enabled_count=0
+    local total_params=0
+    
+    for param_info in "${params[@]}"; do
+        local key="${param_info%%|*}"
+        local name="${param_info##*|}"
+        local value=$(sysctl -n "$key" 2>/dev/null || echo "未知")
+        echo -e "  $name: ${Blue}$value${Font}"
+        
+        # 简单判断是否为加速值
+        total_params=$((total_params + 1))
+        case "$key" in
+            "net.ipv4.tcp_fastopen")
+                [[ "$value" == "3" ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.ipv4.tcp_slow_start_after_idle")
+                [[ "$value" == "0" ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.core.rmem_max")
+                [[ "$value" -gt 212992 ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.core.wmem_max")
+                [[ "$value" -gt 212992 ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.ipv4.tcp_tw_reuse")
+                [[ "$value" == "1" ]] && enabled_count=$((enabled_count + 1))
+                ;;
+            "net.ipv4.tcp_fin_timeout")
+                [[ "$value" -lt 60 ]] && enabled_count=$((enabled_count + 1))
+                ;;
+        esac
+    done
+    
+    echo
+    
+    # 综合判断加速状态
+    if $is_bbr && [[ $enabled_count -ge $((total_params / 2)) ]]; then
+        echo -e "${Green}端口转发加速: 已启用${Font}"
+    elif $is_bbr || [[ $enabled_count -gt 0 ]]; then
+        echo -e "${Yellow}端口转发加速: 部分启用${Font} (已优化 $enabled_count/$total_params 项参数)"
+    else
+        echo -e "${Red}端口转发加速: 未启用${Font}"
+    fi
 }
 
 # 设置域名监控服务
@@ -1780,10 +1942,11 @@ monitor_domain_ip() {
         echo "$(date): 检测到域名 $domain 的IP变更: $cached_ip -> $current_ip" >> "${SOCATS_DIR}/dns_monitor.log"
         echo "$current_ip" > "$cache_file"
         
-        # 重启对应的socat服务
-        local service_name="socat-${listen_port}-*"
-        systemctl restart $service_name
-        echo "$(date): 已重启转发服务 $service_name" >> "${SOCATS_DIR}/dns_monitor.log"
+        # 重启对应的socat服务（精确指定TCP和UDP服务）
+        local tcp_service="socat-${LISTEN_PORT}-${REMOTE_PORT}-tcp"
+        local udp_service="socat-${LISTEN_PORT}-${REMOTE_PORT}-udp"
+        systemctl restart "$tcp_service" "$udp_service" 2>/dev/null
+        echo "$(date): 已重启转发服务 $tcp_service $udp_service" >> "${SOCATS_DIR}/dns_monitor.log"
         return 0
     fi
     
@@ -1798,6 +1961,12 @@ EOF
     
     # 创建systemd定时器服务
     local timer_name="domain-monitor-${listen_port}"
+    
+    # 检查定时器是否已存在，若存在则跳过
+    if systemctl is-active --quiet "$timer_name.timer" 2>/dev/null; then
+        echo -e "${Yellow}域名 ${domain} 的监控定时器已存在，跳过创建${Font}"
+        return 0
+    fi
     
     cat > /etc/systemd/system/${timer_name}.service <<EOF
 [Unit]
@@ -2190,9 +2359,10 @@ show_menu() {
     echo -e "${Yellow}3.${Font} Socat管理"
     echo -e "${Yellow}4.${Font} 开启端口转发加速"
     echo -e "${Yellow}5.${Font} 关闭端口转发加速"
-    echo -e "${Yellow}6.${Font} 设置域名监控频率"
-    echo -e "${Yellow}7.${Font} 配置文件JSON格式化 ($([ "$JSON_FORMAT_ENABLED" -eq 1 ] && echo "开启" || echo "关闭"))"
-    echo -e "${Yellow}8.${Font} 退出脚本"
+    echo -e "${Yellow}6.${Font} 查看加速状态"
+    echo -e "${Yellow}7.${Font} 设置域名监控频率"
+    echo -e "${Yellow}8.${Font} 配置文件JSON格式化 ($([ "$JSON_FORMAT_ENABLED" -eq 1 ] && echo "开启" || echo "关闭"))"
+    echo -e "${Yellow}9.${Font} 退出脚本"
     echo -e "${Blue}==========================================${Font}"
     echo -e "${Green}当前 IPv4: ${ip:-未知}${Font}"
     echo -e "${Green}当前 IPv6: ${ipv6:-未知}${Font}"
@@ -2209,12 +2379,12 @@ main() {
     ip=$(get_ip)
     ipv6=$(get_ipv6)
 
-    // 加载JSON格式化设置
+    # 加载JSON格式化设置
     if [ -f "$SOCATS_DIR/.json_format" ]; then
         source "$SOCATS_DIR/.json_format"
     fi
     
-    // 初始化标记检查
+    # 初始化标记检查
     if [ ! -f "$SOCATS_DIR/.initialized" ]; then
     init_config
     restore_forwards
@@ -2230,7 +2400,7 @@ main() {
     
     while true; do
         show_menu
-        read -p "请输入选项 [1-8]: " choice
+        read -p "请输入选项 [1-9]: " choice
         clear_screen
         case $choice in
             1)
@@ -2265,14 +2435,18 @@ main() {
                 press_any_key
                 ;;
             6)
-                change_monitor_interval
+                show_acceleration_status
                 press_any_key
                 ;;
             7)
-                toggle_json_format
+                change_monitor_interval
                 press_any_key
                 ;;
             8)
+                toggle_json_format
+                press_any_key
+                ;;
+            9)
                 echo -e "${Green}感谢使用,再见!${Font}"
                 exit 0
                 ;;
